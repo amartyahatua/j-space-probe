@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+direction_bank/
+direction_bank_dryrun/
+.venv/
+*.pt
