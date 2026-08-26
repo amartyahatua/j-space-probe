@@ -100,3 +100,46 @@ def mock_contexts_and_counterfact(n_contexts: int = 20, n_facts: int = 10):
         for i in range(n_facts)
     ]
     return contexts, counterfact
+
+
+class MockGenerativeTokenizer:
+    """
+    Like MockTokenizer, but also supports .decode() and .eos_token_id
+    so it can drive real .generate() calls in tests -- used for Stage
+    2 (and any later stage that needs generation) rather than
+    Stage 1's plain MockTokenizer, which only needs single forward
+    passes. Meant to be paired with a REAL (tiny, randomly
+    initialized) HF model class in tests, not the custom MockModel
+    above, since MockModel has no .generate() implementation.
+
+    IMPORTANT: deterministic by design -- the same text always
+    produces the same token ids (seeded from hash(text)), the same
+    way a real tokenizer would. An earlier version used un-seeded
+    torch.randint() here, which silently made every call to the SAME
+    text return DIFFERENT ids -- harmless for Stages 1-3's dry runs
+    (which only check that the pipeline runs, not that anything is
+    learned), but it meant Stage 4's training convergence tests were
+    training against a fresh random target every single step, with
+    nothing consistent to learn. Caught via a real convergence check,
+    not by inspection -- worth remembering when trusting a mock's
+    "it ran without crashing" as sufficient.
+    """
+
+    def __init__(self, vocab_size: int = 100):
+        self.vocab_size = vocab_size
+        self.eos_token_id = vocab_size - 1
+
+    def __call__(self, text, return_tensors="pt"):
+        seq_len = min(16, max(4, len(text) // 4))
+        gen = torch.Generator().manual_seed(abs(hash(text)) % (2**31))
+        ids = torch.randint(0, self.vocab_size - 1, (1, seq_len), generator=gen)
+        return {"input_ids": ids}
+
+    def encode(self, text, add_special_tokens=False):
+        return [abs(hash(text)) % (self.vocab_size - 1)]
+
+    def decode(self, ids, skip_special_tokens=True):
+        ids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+        if skip_special_tokens:
+            ids = [i for i in ids if i != self.eos_token_id]
+        return " ".join(f"tok{i}" for i in ids)

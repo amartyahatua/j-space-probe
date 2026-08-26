@@ -11,6 +11,8 @@ efficacy is exactly that case).
 import torch
 from typing import List, Dict
 
+from model_utils import get_transformer_layers
+
 
 def steer_hook(direction: torch.Tensor, alpha: float):
     def hook(module, inp, out):
@@ -47,7 +49,7 @@ def behavioral_change_score(
         base_logp = torch.log_softmax(base_logits, dim=-1)
 
         for alpha in alphas:
-            handle = model.model.layers[layer].register_forward_hook(
+            handle = get_transformer_layers(model)[layer].register_forward_hook(
                 steer_hook(direction, alpha)
             )
             try:

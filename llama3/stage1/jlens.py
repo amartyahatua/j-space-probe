@@ -20,6 +20,8 @@ becomes available.
 import torch
 from typing import List, Dict, Tuple
 
+from model_utils import get_transformer_layers
+
 
 def compute_jlens_direction(
     model,
@@ -28,6 +30,7 @@ def compute_jlens_direction(
     target_token_id: int,
     contexts: List[str],
     device: str = "cuda",
+    verbose_every: int = 0,
 ) -> torch.Tensor:
     """
     Average, over `contexts`, the gradient of the target token's final-
@@ -36,11 +39,16 @@ def compute_jlens_direction(
 
     Returns an unnormalized direction vector; callers should normalize
     or norm-match it downstream as needed.
+
+    `verbose_every`: if > 0, print progress every N contexts — this
+    loop does one full forward+backward pass per context with no
+    batching, so on CPU it can take a while; without this you can't
+    tell "slow" from "stuck".
     """
     accum = None
     n = 0
 
-    for text in contexts:
+    for i, text in enumerate(contexts):
         inputs = tokenizer(text, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -52,7 +60,7 @@ def compute_jlens_direction(
             captured["h"] = h
             return out
 
-        handle = model.model.layers[layer].register_forward_hook(hook)
+        handle = get_transformer_layers(model)[layer].register_forward_hook(hook)
         try:
             logits = model(**inputs).logits  # [1, seq, vocab]
             target_logprob = torch.log_softmax(logits[0, -1], dim=-1)[target_token_id]
@@ -65,9 +73,15 @@ def compute_jlens_direction(
         finally:
             handle.remove()
 
+        if verbose_every and (i + 1) % verbose_every == 0:
+            print(f"      ...{i + 1}/{len(contexts)} contexts processed for this direction", flush=True)
+
     if n == 0:
         raise ValueError("No contexts produced a usable gradient.")
-    return (accum / n).cpu()
+    direction = (accum / n).float().cpu()
+    return direction / direction.norm()  # unit-normalize to match probes.py's convention —
+    # raw gradient magnitude is otherwise tiny and incomparable to other direction classes
+    # when steering with a fixed alpha (see causal_efficacy.py)
 
 
 def build_jspace_directions(
@@ -80,10 +94,16 @@ def build_jspace_directions(
 ) -> Dict[Tuple[int, str], torch.Tensor]:
     """Compute J-lens directions for every (layer, target token) pair."""
     directions = {}
-    for layer in layers:
-        for tok in target_tokens:
-            tok_id = tokenizer.encode(tok, add_special_tokens=False)[0]
-            directions[(layer, tok)] = compute_jlens_direction(
-                model, tokenizer, layer, tok_id, contexts, device=device
-            )
+    combos = [(layer, tok) for layer in layers for tok in target_tokens]
+    print(
+        f"Computing J-lens directions: {len(combos)} (layer, token) pairs x "
+        f"{len(contexts)} contexts each = {len(combos) * len(contexts)} forward+backward passes total.",
+        flush=True,
+    )
+    for i, (layer, tok) in enumerate(combos):
+        tok_id = tokenizer.encode(tok, add_special_tokens=False)[0]
+        directions[(layer, tok)] = compute_jlens_direction(
+            model, tokenizer, layer, tok_id, contexts, device=device, verbose_every=100,
+        )
+        print(f"  [{i + 1}/{len(combos)}] done: layer={layer}, token='{tok}'", flush=True)
     return directions

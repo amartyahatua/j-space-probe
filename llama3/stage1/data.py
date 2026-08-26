@@ -19,20 +19,35 @@ without requiring the package or network access.
 from typing import List, Dict, Optional
 
 
-def load_fineweb_contexts(n: int, seed: int = 0) -> List[str]:
-    """Stream `n` short natural-language passages from FineWeb."""
+def load_context_corpus(n: int, seed: int = 0, progress_every: int = 200) -> List[str]:
+    """
+    Load `n` short natural-language passages to use as the background
+    context distribution for J-lens averaging and causal-efficacy
+    scoring.
+
+    Uses FineWeb's "sample-10BT" config, NOT the full corpus.
+    `load_dataset("HuggingFaceFW/fineweb", ...)` with no `name=`
+    resolves to the entire multi-terabyte dataset (tens of thousands
+    of shard files) — that's what causes a long stall on "Resolving
+    data files" / streaming-shuffle. The 10B-token sample config is
+    still large but orders of magnitude fewer shards and streams much
+    faster. Buffer size is also kept small (fast first yield, still
+    reasonably mixed) rather than the 10k-row buffer used before.
+    """
     from datasets import load_dataset
 
-    ds = load_dataset("HuggingFaceFW/fineweb", split="train", streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+    ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True)
+    ds = ds.shuffle(seed=seed, buffer_size=500)
 
     out = []
-    for row in ds:
+    for i, row in enumerate(ds):
         text = row["text"].strip()
         if len(text) > 50:
             out.append(text[:512])  # truncate to a manageable context length
         if len(out) >= n:
             break
+        if progress_every and i % progress_every == 0:
+            print(f"  ...streamed {i} rows, kept {len(out)}/{n} contexts so far", flush=True)
     return out
 
 
@@ -48,13 +63,21 @@ def load_counterfact(n: Optional[int] = None) -> List[Dict]:
 
     ds = load_dataset("NeelNanda/counterfact-tracing", split="train")
     records = []
+    skipped = 0
     for row in ds:
+        relation = row.get("relation_prefix", row.get("template", ""))
+        if not relation or not str(relation).strip():
+            skipped += 1
+            continue
         records.append({
             "subject": row.get("subject"),
-            "relation": row.get("relation_prefix", row.get("template", "")),
+            "relation": relation,
             "object_true": row.get("target_true", row.get("object_true", "")),
             "object_new": row.get("target_new", row.get("object_new", "")),
         })
         if n and len(records) >= n:
             break
+
+    if skipped:
+        print(f"  (skipped {skipped} CounterFact rows with an empty/missing relation field)")
     return records

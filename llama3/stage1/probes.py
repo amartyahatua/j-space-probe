@@ -15,6 +15,8 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from typing import List, Dict, Tuple
 
+from model_utils import get_transformer_layers
+
 
 def get_residual_activations(
     model, tokenizer, texts: List[str], layer: int, device: str
@@ -25,10 +27,10 @@ def get_residual_activations(
 
     def hook(module, inp, out):
         h = out[0] if isinstance(out, tuple) else out
-        captured["h"] = h.detach()
+        captured["h"] = h.detach().float()  # cast off bfloat16 here — sklearn/numpy can't handle it downstream
         return out
 
-    handle = model.model.layers[layer].register_forward_hook(hook)
+    handle = get_transformer_layers(model)[layer].register_forward_hook(hook)
     try:
         with torch.no_grad():
             for text in texts:
