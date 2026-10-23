@@ -120,3 +120,15 @@ python stage7_run.py --bank_dir ../stage1/direction_bank
 # --alpha isn't passed; layer defaults to 19 (middle of CFG.sae_layers). Override
 # either explicitly if you calibrated a different layer, e.g.:
 #   python stage7_run.py --bank_dir ../stage1/direction_bank --layer 19 --alpha 12.0
+
+
+# ============================================================
+# CAMERA-READY ADDITIONS  (see PROTOCOL.md for definitions, the ordered run plan and how to read the controls)
+# ============================================================
+# Offline tests, no GPU/downloads needed:        python -m pytest tests -q
+# Natural activation scale (report alpha/||h||):  cd stage1 && python activation_scale.py
+# Output-pathway control, Stage 2 / 3 / 7:        --unembed_control   (Stage 3 also --efficacy_check, --unembed_scope all_labels)
+# Seeds / shuffle / bootstrap:                    --seed N  (Stages 2-5, 7);  --shuffle (Stages 4, 7);  --n_boot
+# Generic concepts with the capstone recipe:      stage4_train.py --input_provider varied
+# Random-direction reporter baseline:             stage4_train.py --direction_source random
+# Across-seed table:                              stage6/aggregate_seeds.py --kind stage5|stage7 <results.json ...>

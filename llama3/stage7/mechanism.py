@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage2"))
 from model_utils import get_transformer_layers, format_prompt_for_chat
 from editing import apply_direction_editing
-from scoring import exact_match_score
+from scoring import exact_match_score, score_reports
 
 from covert_cognition import build_cell_prompt, ELICITATION_PROMPT, LABEL_INJECTION
 
@@ -87,20 +87,20 @@ def ablation_test(peft_model, tokenizer, layer, direction, alpha: float, target_
     def rate(direction_alpha, prompt, apply_hook=True):
         reports = _generate(peft_model, tokenizer, layer, direction, direction_alpha, prompt, device,
                              n_trials=n_trials, max_new_tokens=max_new_tokens, apply_hook=apply_hook)
-        scores = [s for s in (exact_match_score(r, target_label) for r in reports) if s is not None]
-        return (sum(scores) / len(scores) if scores else None), reports
+        counts = score_reports(reports, target_label)     # same scoring as exact_match_score, plus exact k/n
+        return counts["rate"], reports, counts
 
-    baseline_rate, baseline_reports = rate(sign * alpha, normal_prompt)
-    ablate_direction_rate, ablate_direction_reports = rate(0.0, normal_prompt)
-    ablate_input_rate, ablate_input_reports = rate(sign * alpha, ablated_input_prompt)
-    no_hook_rate, no_hook_reports = rate(sign * alpha, normal_prompt, apply_hook=False)
+    baseline_rate, baseline_reports, baseline_counts = rate(sign * alpha, normal_prompt)
+    ablate_direction_rate, ablate_direction_reports, ablate_direction_counts = rate(0.0, normal_prompt)
+    ablate_input_rate, ablate_input_reports, ablate_input_counts = rate(sign * alpha, ablated_input_prompt)
+    no_hook_rate, no_hook_reports, no_hook_counts = rate(sign * alpha, normal_prompt, apply_hook=False)
 
     return {
         "target_label": target_label, "layer": layer, "alpha": sign * alpha, "split": split,
-        "baseline": {"match_rate": baseline_rate, "reports": baseline_reports},
-        "ablate_direction": {"match_rate": ablate_direction_rate, "reports": ablate_direction_reports},
-        "ablate_input": {"match_rate": ablate_input_rate, "reports": ablate_input_reports},
-        "no_hook_control": {"match_rate": no_hook_rate, "reports": no_hook_reports},
+        "baseline": {"match_rate": baseline_rate, "counts": baseline_counts, "reports": baseline_reports},
+        "ablate_direction": {"match_rate": ablate_direction_rate, "counts": ablate_direction_counts, "reports": ablate_direction_reports},
+        "ablate_input": {"match_rate": ablate_input_rate, "counts": ablate_input_counts, "reports": ablate_input_reports},
+        "no_hook_control": {"match_rate": no_hook_rate, "counts": no_hook_counts, "reports": no_hook_reports},
         "direction_necessary": (baseline_rate is not None and ablate_direction_rate is not None
                                  and ablate_direction_rate < baseline_rate),
         "input_necessary": (baseline_rate is not None and ablate_input_rate is not None

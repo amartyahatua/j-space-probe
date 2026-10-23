@@ -159,6 +159,33 @@ def exact_match_score(
     return 0
 
 
+def score_reports(
+    reports: List[str], target_concept: Optional[str], candidate_labels: Optional[List[str]] = None,
+) -> Dict:
+    """
+    Exact counts behind a reported rate. Returns
+        k            reports scored 1
+        n            reports that were scorable (target_concept given)
+        n_total      reports generated
+        n_degenerate reports flagged as repetition loops (scored 0, kept in n)
+        n_multi_label reports flagged as shotgun listings (scored 0, kept in n)
+        rate         k / n  (None if n == 0)
+    so every percentage in a table can be traced to an integer k out of an integer n.
+    Scoring itself is exactly exact_match_score -- nothing here changes what counts as a match.
+    """
+    scores = [exact_match_score(r, target_concept, candidate_labels=candidate_labels) for r in reports]
+    scored = [s for s in scores if s is not None]
+    k = int(sum(scored))
+    n = len(scored)
+    return {
+        "k": k, "n": n, "n_total": len(reports),
+        "n_degenerate": sum(1 for r in reports if is_degenerate_repetition(r)),
+        "n_multi_label": (sum(1 for r in reports if mentions_multiple_labels(r, candidate_labels))
+                          if candidate_labels else 0),
+        "rate": (k / n) if n else None,
+    }
+
+
 def infer_target_concept(direction_key: str) -> Optional[str]:
     """
     J-space directions are named "jspace::{layer}::{token}" -- the
