@@ -35,7 +35,7 @@ from direction_source import pair_direction
 from protocol import (seed_everything, write_protocol, decoding_settings, model_protocol,
                       load_activation_norms)
 
-from generalization import evaluate_correlated, evaluate_decorrelated
+from generalization import evaluate_correlated, evaluate_decorrelated, _resolve_alpha
 from mechanism_check import jacobian_alignment_pre_post, ablation_test
 
 
@@ -45,9 +45,10 @@ def load_bank(bank_dir: str):
     return vectors, metadata
 
 
-def run_mechanism_checks(peft_model, tokenizer, vectors, pairs, layers, alpha, elicitation_prompt, device, n_trials,
+def run_mechanism_checks(peft_model, tokenizer, vectors, pairs, layers, alphas, elicitation_prompt, device, n_trials,
                           max_new_tokens, provider=None, direction_source="jspace", direction_seed=0,
                           candidate_labels=None):
+    """alphas: per-layer dict OR a single float -- see generalization._resolve_alpha."""
     provider = provider or get_input_provider("template")
     results = []
     for (x, y) in pairs:
@@ -56,6 +57,7 @@ def run_mechanism_checks(peft_model, tokenizer, vectors, pairs, layers, alpha, e
             if d_xy is None:
                 continue
             prompt = f"{provider.eval_texts(x)[0]}\n{elicitation_prompt}"
+            alpha = _resolve_alpha(alphas, layer)
 
             jac = jacobian_alignment_pre_post(peft_model, tokenizer, layer, d_xy, prompt, x, device)
             ab = ablation_test(peft_model, tokenizer, layer, d_xy, alpha, x, elicitation_prompt, device,
@@ -71,7 +73,16 @@ def main():
     parser.add_argument("--adapter_dir", default="../stage4/stage4_adapter")
     parser.add_argument("--bank_dir", default="../stage1/direction_bank")
     parser.add_argument("--out_dir", default="stage5_results")
-    parser.add_argument("--alt_alphas", type=float, nargs="+", default=[4.0, 6.0, 10.0, 12.0, 16.0])
+    parser.add_argument("--alt_alphas", type=float, nargs="+", default=[4.0, 6.0, 10.0, 12.0, 16.0],
+                         help="Deliberately applied as a single value across ALL train_layers at once "
+                              "(unlike the calibrated per-layer split['alpha']) -- this test is asking "
+                              "whether the adapter generalizes to off-training coefficients, not "
+                              "re-calibrating per layer. Given the alpha_sweep.py calibration "
+                              "(layers 3/7 collapse above ~2, layers 19-27 stay coherent to ~6-7), "
+                              "expect several of these to already be in the collapse regime for the "
+                              "shallow train_layers -- a low match_rate there reflects that, not "
+                              "necessarily a generalization failure. Read the actual reports, same as "
+                              "everywhere else, before concluding anything from this cell alone.")
     parser.add_argument("--n_trials", type=int, default=3)
     parser.add_argument("--max_new_tokens", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0, help="Seeds generation sampling; also the bootstrap seed.")
@@ -136,6 +147,14 @@ def main():
     held_out_pairs = [tuple(p) for p in split["held_out_pairs"]]
     train_layers, held_out_layers = split["train_layers"], split["held_out_layers"]
     alpha, prompt = split["alpha"], split["elicitation_prompt"]
+    # JSON object keys are always strings, so a per-layer alpha dict loaded
+    # from split.json (written by stage4_train.py's json.dump) comes back as
+    # {"3": 1.5, ...} while train_layers (a JSON array) comes back as real
+    # ints [3, 7, ...]. Normalize to int keys here so every downstream
+    # _resolve_alpha(alphas, layer) lookup with an int layer succeeds. A
+    # scalar float alpha (dry_run / explicit override) passes through as-is.
+    if isinstance(alpha, dict):
+        alpha = {int(k): v for k, v in alpha.items()}
 
     # Stage 5 must evaluate with the inputs and directions Stage 4 trained on (older adapters: template + jspace).
     provider = get_input_provider(args.input_provider or split.get("input_provider", "template"))

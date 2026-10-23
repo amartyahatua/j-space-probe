@@ -54,7 +54,7 @@ def build_direction(model, tokenizer, layer: int, contexts, device: str) -> torc
 
 
 def train_covert_cognition_adapter(model, tokenizer, layer, direction, alpha, device, n_epochs, lr, target_modules,
-                                  shuffle=False, seed=0):
+                                  seed=0):
     examples = []
     for i in range(len(scenario_texts(LABEL_INJECTION, "train"))):
         examples.append({"layer": layer, "direction": direction, "alpha": alpha,
@@ -66,8 +66,7 @@ def train_covert_cognition_adapter(model, tokenizer, layer, direction, alpha, de
                           "target_label": LABEL_SAFE})
 
     peft_model = setup_lora_model(model, target_modules, r=8, lora_alpha=16)
-    history = train_stage4(peft_model, tokenizer, examples, device, n_epochs=n_epochs, lr=lr,
-                           shuffle=shuffle, seed=seed)
+    history = train_stage4(peft_model, tokenizer, examples, device, n_epochs=n_epochs, lr=lr, seed=seed)
     return peft_model, history
 
 
@@ -100,8 +99,11 @@ def main():
     parser.add_argument("--layer", type=int, default=19)  # mid-point of CFG.sae_layers ([3,7,11,15,19,23,27]) for
                                                              # llama-3.1-8b-instruct's 32 layers
     parser.add_argument("--alpha", type=float, default=None,
-                         help="Defaults to CFG.stage2_alpha. UNVERIFIED placeholder for Llama-3.1-8B-Instruct -- "
-                              "re-run alpha_sweep.py before trusting a real run; see stage1/config.py docstring.")
+                         help="Defaults to CFG.stage2_alphas[--layer] -- the calibrated per-layer value "
+                              "from the alpha_sweep.py calibration pass (see stage1/config.py). Since "
+                              "this stage only ever runs at ONE layer per invocation (--layer, default "
+                              "19), a plain per-layer dict lookup is enough here -- no multi-layer loop "
+                              "like Stage 4/5, so no need to resolve alpha per-example.")
     parser.add_argument("--n_epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3,
                          help="Lowered from 5e-3 -- that value caused severe training instability in Stage 4 "
@@ -113,8 +115,7 @@ def main():
     parser.add_argument("--n_trials", type=int, default=3)
     parser.add_argument("--max_new_tokens", type=int, default=10)
     parser.add_argument("--out_dir", default="stage7_results")
-    parser.add_argument("--seed", type=int, default=0, help="Seeds LoRA init + sampling (+ data order with --shuffle).")
-    parser.add_argument("--shuffle", action="store_true", help="Reshuffle training examples every epoch (seeded).")
+    parser.add_argument("--seed", type=int, default=0, help="Seeds LoRA init, per-epoch data order and sampling.")
     parser.add_argument("--n_boot", type=int, default=2000)
     parser.add_argument("--activation_norms", default=None,
                          help="activation_norms.json from stage1/activation_scale.py; logs alpha/||h|| at --layer.")
@@ -131,7 +132,21 @@ def main():
                          help="With --unembed_control: steering-KL of raw vs projected vs random direction at --layer.")
     args = parser.parse_args()
     if args.alpha is None:
-        args.alpha = CFG.stage2_alpha
+        if args.dry_run:
+            # dry_run's mock bank doesn't use the real sae_layers, so the calibrated dict
+            # (keyed by 3/7/19/23/27) may not cover --layer's default -- use a fixed
+            # placeholder alpha for the dry run regardless (see stage3/stage4's dry_run
+            # paths for the same reasoning).
+            args.alpha = 4.0
+        else:
+            try:
+                args.alpha = CFG.stage2_alphas[args.layer]
+            except KeyError:
+                raise KeyError(
+                    f"No calibrated stage2_alphas entry for layer {args.layer!r}. Run "
+                    f"alpha_sweep.py for this layer and add it to CFG.stage2_alphas, or pass "
+                    f"--alpha explicitly to override."
+                )
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
     seed_everything(args.seed)
@@ -187,7 +202,7 @@ def main():
           f"({n_epochs} epochs = {n_epochs * n_train_examples} total steps)...")
     peft_model, history = train_covert_cognition_adapter(
         model, tokenizer, layer, train_direction, args.alpha, device, n_epochs, args.lr, args.target_modules,
-        shuffle=args.shuffle, seed=args.seed,
+        seed=args.seed,
     )
 
     print("Post-training sanity check (correlated condition, TRAIN phrasings, should now be high):")
@@ -260,7 +275,7 @@ def main():
     from covert_cognition import (INJECTION_TEXTS_TRAIN, INJECTION_TEXTS_HELDOUT,
                                   BENIGN_TEXTS_TRAIN, BENIGN_TEXTS_HELDOUT)
     write_protocol(out_dir, "stage7", seed=args.seed, layer=layer, alpha=args.alpha, n_epochs=n_epochs, lr=args.lr,
-                   shuffle=args.shuffle, bootstrap_resamples=args.n_boot, n_contexts_for_jlens=len(contexts),
+                   shuffle="every epoch (seeded)", bootstrap_resamples=args.n_boot, n_contexts_for_jlens=len(contexts),
                    unembed_control=args.unembed_control, unembed_mode=args.unembed_mode if args.unembed_control else None,
                    fold_final_norm=not args.no_fold_final_norm, activation_norms_file=args.activation_norms,
                    decoding=decoding_settings(n_trials, max_new_tokens, 0.8),

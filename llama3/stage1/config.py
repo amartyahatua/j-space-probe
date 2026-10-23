@@ -96,7 +96,7 @@ releases (this is what broke the original hook_point-based scheme):
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Dict
 
 
 @dataclass
@@ -176,8 +176,28 @@ class Config:
 
     # --- Stage 2: verbalizability elicitation ---
     stage2_prompt: str = "Question: What concept is active in your thinking right now?\nAnswer:"
-    stage2_alpha: float = 12.0                # UNVERIFIED PLACEHOLDER — see module docstring.
-                                               # Re-run alpha_sweep.py before trusting for a real run.
+    stage2_alphas: Dict[int, float] = field(default_factory=lambda: {
+        3:  1.5,   # layers 3 & 7: coherence ceiling only -- no real target-concept content ever
+        7:  1.5,   # appeared at any tested alpha (0.5-2 fine-grained sweeps on both layers) before
+                   # collapse. Picked the highest still-coherent value; this is likely a genuine
+                   # shallow-layer finding (too little abstraction this early to verbalize a
+                   # literal concept), not a mistuned alpha -- see alpha_sweep.py output from
+                   # 2026-08 calibration pass before assuming it's fixable with more sweeping.
+        19: 6.0,   # clean, non-collapsed target mentions confirmed at alpha=6 (top of the range
+                   # swept -- true ceiling may be a bit higher, untested above 6).
+        23: 6.0,   # same sweet spot as 19/27, confirmed clean through alpha=7 with no collapse.
+        27: 6.5,   # sweet spot 6-7; collapse (token-repetition / word-gluing) confirmed starting
+                   # at alpha=8 -- see is_degenerate_repetition in scoring.py, which the earlier
+                   # alpha=12 default was silently defeating (glued repeats like "catcatcatcat"
+                   # have no whitespace, so a naive whole-word repetition check never saw them).
+    })                 # Replaces the old flat `stage2_alpha` float -- one global alpha was wrong
+                       # for every layer in different directions (too strong for 3/7, and the
+                       # 8-24 causal-efficacy steer_alphas below are probably ALSO in the
+                       # collapse regime at these layers -- worth a similar sweep-and-recheck of
+                       # tag_causal_efficacy's output before trusting metadata.json's
+                       # causal_efficacy values as final). CFG.sae_layers changes -> this dict
+                       # needs a matching entry, or stage2_elicit.py raises KeyError rather than
+                       # silently defaulting -- intentional, so a new layer never runs unsweept.
     stage2_n_trials: int = 5                  # generations per direction, for a match RATE not a single 0/1
     stage2_max_new_tokens: int = 30
     stage2_temperature: float = 0.8

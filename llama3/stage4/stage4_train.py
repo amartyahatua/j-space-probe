@@ -69,9 +69,19 @@ def build_split(pairs, layers, n_holdout_pairs: int, n_holdout_layers: int):
 # default is several carrier templates per label (Stage 4 instability fix) and what `varied` changes.
 
 
-def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitation_prompt,
+def build_training_examples(vectors, train_pairs, train_layers, alphas, elicitation_prompt,
                             provider=None, direction_source="jspace", direction_seed=0):
     """
+    alphas: EITHER a per-layer dict (the normal case -- CFG.stage2_alphas,
+    the calibrated table from alpha_sweep.py) OR a single float (the
+    --alpha override / dry_run path, applied uniformly). train_layers
+    typically spans multiple depths at once, and a single alpha across
+    that range is exactly the miscalibration the alpha_sweep.py
+    calibration pass fixed: alpha=1.5 is right for layer 3 but
+    inert-to-nothing by layer 19, while alpha=6 is fine at layer 19 but
+    already collapsing by layer 3/7. Resolving per-layer here means each
+    layer's training examples use ITS calibrated alpha.
+
     Correlated condition only: direction and input agree. With the default TemplateInputs provider and
     direction_source="jspace" this reproduces the original example list exactly (same order).
     """
@@ -83,6 +93,21 @@ def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitati
             if d_xy is None:
                 continue
 
+            if isinstance(alphas, dict):
+                try:
+                    alpha = alphas[layer]
+                except KeyError:
+                    raise KeyError(
+                        f"No calibrated stage2_alphas entry for layer {layer!r}. If CFG.sae_layers "
+                        f"gained a new layer, run alpha_sweep.py for it and add the entry before "
+                        f"trusting a real Stage 4 run -- or pass --alpha to force a single value "
+                        f"across all layers (not recommended, see --help)."
+                    )
+            else:
+                alpha = alphas
+
+            # correlated condition only: direction and input agree. Several input texts per label --
+            # see stage3/input_provider.py for the template vs varied recipes.
             xs, ys = provider.train_texts(x), provider.train_texts(y)
             for i in range(max(len(xs), len(ys))):
                 examples.append({
@@ -96,19 +121,31 @@ def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitati
     return examples
 
 
-def select_eval_examples(examples):
-    """One example per distinct target label (first occurrence). The old `examples[:6]` slice covered
-    only the first pair, so the post-training sanity check silently never looked at the other labels."""
-    seen, picked = set(), []
+def stratified_eval_examples(examples, max_eval=12):
+    """
+    Up to max_eval examples STRATIFIED across every distinct (target_label, layer) combo -- not the first
+    max_eval in list order. build_training_examples() emits examples grouped pair-by-pair then layer-by-layer,
+    so a plain examples[:N] slice always checks the same single pair at its first layer. That is what hid a real
+    problem on a Llama-3.1-8B-Instruct run (0% match on the first pair/layer said nothing about the other layers
+    and pairs).
+    """
+    if len(examples) <= max_eval:
+        return list(examples)
+    seen, stratified = set(), []
     for ex in examples:
-        if ex["target_label"] not in seen:
-            seen.add(ex["target_label"])
-            picked.append(ex)
-    return picked
+        key = (ex["target_label"], ex["layer"])
+        if key not in seen:
+            seen.add(key)
+            stratified.append(ex)
+    return stratified[:max_eval]
 
 
-def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens=10):
-    """Quick sanity check: does the trained adapter now actually produce the label on TRAINING examples?"""
+def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens=10, max_eval=12):
+    """
+    Quick sanity check: does the trained adapter now actually produce the label on TRAINING examples?
+    Samples via stratified_eval_examples (see its docstring); each row carries exact k/n.
+    """
+    examples = stratified_eval_examples(examples, max_eval)
     all_labels = list({ex["target_label"] for ex in examples})  # for shotgun-listing detection --
     # a report reciting several of these at once shouldn't count as a genuine match for any of them
     results = []
@@ -128,7 +165,12 @@ def main():
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--bank_dir", default="../stage1/direction_bank")
     parser.add_argument("--out_dir", default="stage4_adapter")
-    parser.add_argument("--alpha", type=float, default=None, help="Defaults to CFG.stage2_alpha.")
+    parser.add_argument("--alpha", type=float, default=None,
+                         help="Override: use this ONE alpha for every layer's training examples "
+                              "instead of the calibrated per-layer CFG.stage2_alphas lookup. Only "
+                              "for quick exploration -- a single alpha spanning layers 3-27 "
+                              "reproduces exactly the miscalibration the Stage 2 alpha_sweep.py "
+                              "calibration pass fixed. Leave unset for a real run.")
     parser.add_argument("--n_epochs", type=int, default=10,
                          help="Training examples are now 4x larger (multiple prompt templates per label, "
                               "see TRAINING_INPUT_TEMPLATES) -- fewer epochs needed for a similar total step "
@@ -146,9 +188,8 @@ def main():
                          help="LoRA target module names. Qwen2/Llama/Gemma-2 family: "
                               "['q_proj','k_proj','v_proj','o_proj'] (default). GPT-2 family: ['c_attn'].")
     parser.add_argument("--seed", type=int, default=0,
-                         help="Seeds LoRA initialisation and sampling (and, with --shuffle, data order). "
+                         help="Seeds LoRA initialisation, per-epoch data order and generation sampling. "
                               "Run 3+ seeds for the camera-ready intervals.")
-    parser.add_argument("--shuffle", action="store_true", help="Reshuffle training examples every epoch (seeded).")
     parser.add_argument("--input_provider", choices=["template", "varied"], default="template",
                          help="template = existing 4 label-bearing carrier sentences. varied = the Stage 7 recipe "
                               "(several passages per concept that never name it; held-out phrasings for Stage 5).")
@@ -160,7 +201,6 @@ def main():
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
-    alpha = args.alpha if args.alpha is not None else CFG.stage2_alpha
     seed_everything(args.seed)
     provider = get_input_provider(args.input_provider)
 
@@ -184,6 +224,10 @@ def main():
         # independent of whatever CFG.model_name/--target_modules point to for a real run --
         # GPT-2 uses a fused c_attn Conv1D, not separate q_proj/k_proj/v_proj/o_proj Linears
         args.target_modules = ["c_attn"]
+        # Mock bank uses synthetic layers [2, 4], which aren't in CFG.stage2_alphas (that dict is
+        # keyed by the REAL bank's layers 3/7/19/23/27) -- always use a fixed placeholder alpha
+        # here regardless of --alpha, same reasoning as stage3_run.py's dry_run path.
+        alpha = args.alpha if args.alpha is not None else 4.0
     else:
         model, tokenizer = load_real_model(CFG.model_name, device, CFG.dtype)
         vectors, metadata = load_bank(args.bank_dir)
@@ -191,6 +235,9 @@ def main():
         layers = sorted({m["layer"] for m in metadata.values() if m["class"] == "jspace"})
         out_dir = args.out_dir
         n_epochs = args.n_epochs
+        # Per-layer calibrated dict by default (resolved per training example inside
+        # build_training_examples); --alpha overrides with a single value everywhere.
+        alpha = args.alpha if args.alpha is not None else CFG.stage2_alphas
 
     train_pairs, held_out_pairs, train_layers, held_out_layers = build_split(
         pairs, layers, args.n_holdout_pairs, args.n_holdout_layers
@@ -208,10 +255,11 @@ def main():
     peft_model.print_trainable_parameters()
 
     history = train_stage4(peft_model, tokenizer, examples, device, n_epochs=n_epochs, lr=args.lr,
-                            max_grad_norm=args.max_grad_norm, shuffle=args.shuffle, seed=args.seed)
+                            max_grad_norm=args.max_grad_norm, seed=args.seed)
 
-    print("\nPost-training sanity eval on TRAINING examples, one per label (should now show high match rates):")
-    eval_results = evaluate(peft_model, tokenizer, select_eval_examples(examples), device)
+    print("\nPost-training sanity eval on TRAINING examples (should now show high match rates):")
+    print("(stratified across every (label, layer) combo -- see stratified_eval_examples())")
+    eval_results = evaluate(peft_model, tokenizer, examples, device)
     for r in eval_results:
         c = r["counts"]
         print(f"  target='{r['target_label']}' layer={r['layer']}: match_rate={r['match_rate']:.2f} ({c['k']}/{c['n']})")
@@ -225,7 +273,7 @@ def main():
             "alpha": alpha, "elicitation_prompt": CFG.stage2_prompt,
             # Stage 5 reads these so it evaluates with the SAME inputs and directions the adapter trained on
             "seed": args.seed, "input_provider": args.input_provider, "direction_source": args.direction_source,
-            "n_epochs": n_epochs, "lr": args.lr, "max_grad_norm": args.max_grad_norm, "shuffle": args.shuffle,
+            "n_epochs": n_epochs, "lr": args.lr, "max_grad_norm": args.max_grad_norm, "shuffle": "every epoch (seeded)",
             "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "target_modules": args.target_modules,
         }, f, indent=2)
     with open(os.path.join(out_dir, "training_history.json"), "w") as f:
@@ -233,7 +281,7 @@ def main():
     with open(os.path.join(out_dir, "training_eval.json"), "w") as f:
         json.dump(eval_results, f, indent=2)
     write_protocol(out_dir, "stage4", seed=args.seed, alpha=alpha, n_epochs=n_epochs, lr=args.lr,
-                   max_grad_norm=args.max_grad_norm, shuffle=args.shuffle, input_provider=args.input_provider,
+                   max_grad_norm=args.max_grad_norm, shuffle="every epoch (seeded)", input_provider=args.input_provider,
                    direction_source=args.direction_source,
                    training_texts={lab: provider.train_texts(lab) for pair in train_pairs for lab in pair},
                    n_training_examples=len(examples), sanity_eval_decoding=decoding_settings(3, 10, 0.8),

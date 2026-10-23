@@ -11,6 +11,14 @@ Everything a reader needs to reconstruct a number in the paper from the code. Ea
 * Every rate in a results file now has its integers beside it (`counts: {k, n, n_total, n_degenerate, n_multi_label}`).
   `n` is the number of scorable generations; **a reported percentage must be k/n for that n**. If it is not, something
   was averaged across cells of unequal size — say so in the table caption or report the pooled k/n instead.
+* Scoring also recovers a hit when the steering hook glues a capitalised label onto the previous word with no space
+  ("aboutFrance"); lowercase labels stay strict whole-word. Repetition detection includes glued-substring loops
+  ("catcatcat"). Numbers produced before this scoring change are not comparable to numbers produced after it: re-score
+  or rerun everything you report with the same code version (`protocol.json` records the commit).
+* Alpha is **per layer** (`CFG.stage2_alphas`, e.g. 1.5 at layers 3/7, 6.0-6.5 at layers 19-27). It is stored in
+  Stage 4's `split.json` and reused by Stages 5 and 7; always report it as alpha/‖h‖ (see below), never as one number.
+* Stage 4 reshuffles the training examples every epoch with the run's `--seed`, so a seed changes both LoRA
+  initialisation and example order.
 * Rates in the Stage 6 tables are means of per-entry rates (entry = pair x layer), shown with the pooled k/n.
 * Decoding: sampling, temperature 0.8, `max_new_tokens` 10 (Stages 3-5, 7) / 30 (Stage 2), chat template applied.
   Generations per item = `--n_trials` (default 3; Stage 2: `stage2_n_trials` = 5), **per input text**.
@@ -72,7 +80,7 @@ python stage5_run.py --adapter_dir ../stage4/adapters/varied_random --out_dir st
 
 # 4. seeds (3), per configuration you will report; then aggregate
 for s in 0 1 2; do
-  python ../stage4/stage4_train.py --seed $s --shuffle --input_provider varied --out_dir ../stage4/adapters/varied_jspace_s$s
+  python ../stage4/stage4_train.py --seed $s --input_provider varied --out_dir ../stage4/adapters/varied_jspace_s$s
   python stage5_run.py --seed $s --adapter_dir ../stage4/adapters/varied_jspace_s$s --out_dir stage5_varied_jspace_s$s
 done
 cd ../stage6 && python aggregate_seeds.py --kind stage5 ../stage5/stage5_varied_jspace_s{0,1,2}/stage5_results.json

@@ -16,10 +16,17 @@ import torch
 from typing import List, Dict, Optional
 
 
-def load_sae(release: str, layer: int, device: str = "cuda"):
+def load_sae(release: str, layer: int, device: str = "cuda", hook_point: str = "hook_resid_pre"):
+    """
+    `hook_point` varies by release — check the release's valid-IDs list
+    (SAELens will print it in the error message if you get it wrong).
+    E.g. "gpt2-small-res-jb" uses "hook_resid_pre"; some other releases
+    (Llama-Scope, the Qwen2-0.5B SAE) use "hook_resid_post"; Gemma Scope
+    uses a different id scheme entirely ("layer_{L}/width_{W}/canonical").
+    """
     from sae_lens import SAE
 
-    sae_id = f"blocks.{layer}.hook_resid_post"
+    sae_id = f"blocks.{layer}.{hook_point}"
     sae, _, _ = SAE.from_pretrained(release=release, sae_id=sae_id, device=device)
     return sae
 

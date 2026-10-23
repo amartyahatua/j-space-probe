@@ -234,13 +234,33 @@ def test_default_training_examples_unchanged_by_refactor():
         assert torch.equal(n["direction"], o[4])
 
 
-def test_select_eval_examples_covers_every_label():
+def test_stratified_eval_examples_cover_every_label_and_layer():
     import stage4_train as s4
-    vectors = {f"jspace::2::{t}": torch.randn(16) for t in ("Paris", "Rome", "dog", "cat")}
-    ex = s4.build_training_examples(vectors, [("Paris", "Rome"), ("dog", "cat")], [2], 12.0, "Q?\nA:")
-    picked = s4.select_eval_examples(ex)
-    assert sorted(e["target_label"] for e in picked) == ["Paris", "Rome", "cat", "dog"]
+    vectors = {f"jspace::{l}::{t}": torch.randn(16) for l in (2, 4) for t in ("Paris", "Rome", "dog", "cat")}
+    ex = s4.build_training_examples(vectors, [("Paris", "Rome"), ("dog", "cat")], [2, 4], 12.0, "Q?\nA:")
+    picked = s4.stratified_eval_examples(ex, max_eval=12)
+    assert {(e["target_label"], e["layer"]) for e in picked} == {(t, l) for t in ("Paris", "Rome", "dog", "cat") for l in (2, 4)}
     assert len({e["target_label"] for e in ex[:6]}) < 4        # the old `examples[:6]` slice missed labels
+    assert s4.stratified_eval_examples(ex[:5], max_eval=12) == ex[:5]
+
+
+def test_per_layer_alpha_dict_is_resolved_per_training_example():
+    import stage4_train as s4
+    from generalization import _resolve_alpha
+    vectors = {f"jspace::{l}::{t}": torch.randn(16) for l in (3, 19) for t in ("Paris", "Rome")}
+    ex = s4.build_training_examples(vectors, [("Paris", "Rome")], [3, 19], {3: 1.5, 19: 6.0}, "Q?\nA:")
+    assert {(e["layer"], abs(e["alpha"])) for e in ex} == {(3, 1.5), (19, 6.0)}
+    assert all(e["alpha"] > 0 for e in ex if e["target_label"] == "Paris") and all(e["alpha"] < 0 for e in ex if e["target_label"] == "Rome")
+    assert _resolve_alpha({3: 1.5}, 3) == 1.5 and _resolve_alpha(6.0, 19) == 6.0
+    with pytest.raises(KeyError):
+        _resolve_alpha({3: 1.5}, 19)
+    with pytest.raises(KeyError):
+        s4.build_training_examples(vectors, [("Paris", "Rome")], [3, 19], {3: 1.5}, "Q?\nA:")
+
+
+def test_score_reports_uses_current_scoring_including_glued_mentions():
+    c = score_reports(["thinking aboutFrance, the country", "France", "catcatcatcat"], "France")
+    assert c["k"] == 2 and c["n"] == 3
 
 
 # ---------------------------------------------------------------- seeds

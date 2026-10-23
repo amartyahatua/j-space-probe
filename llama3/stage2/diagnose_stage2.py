@@ -66,9 +66,14 @@ def main():
             handle.remove()
 
         avg_norm = sum(norms) / len(norms)
+        layer_alpha = CFG.stage2_alphas.get(layer)  # this diagnostic already loops per-layer,
+                                                      # so a per-layer dict lookup is the natural fit --
+                                                      # .get() rather than [] since a results file could
+                                                      # in principle reference a layer no longer calibrated
+        alpha_str = f"{layer_alpha}" if layer_alpha is not None else "NOT CALIBRATED for this layer"
         print(f"layer {layer}: avg residual-stream norm = {avg_norm:.2f}   "
-              f"(current stage2_alpha = {CFG.stage2_alpha})")
-        if avg_norm > CFG.stage2_alpha * 3:
+              f"(current stage2_alphas[{layer}] = {alpha_str})")
+        if layer_alpha is not None and avg_norm > layer_alpha * 3:
             print(f"  -> alpha looks small relative to this layer's typical scale; "
                   f"consider raising it toward ~{avg_norm:.0f}")
 

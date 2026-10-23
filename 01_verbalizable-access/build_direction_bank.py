@@ -30,7 +30,7 @@ def load_real_model(model_name: str, device: str, dtype: str):
 
     torch_dtype = getattr(torch, dtype)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype).to(device)
     model.eval()
     return model, tokenizer
 
@@ -124,12 +124,17 @@ def main():
         model, tokenizer, sae_by_layer = build_mock_model_and_sae(CFG.sae_layers, device)
         contexts, counterfact = mock_contexts_and_counterfact(n_contexts=CFG.jlens_n_contexts)
     else:
-        from data import load_fineweb_contexts, load_counterfact
+        from data import load_context_corpus, load_counterfact
         from sae_features import load_sae
 
         model, tokenizer = load_real_model(CFG.model_name, device, CFG.dtype)
-        sae_by_layer = {l: load_sae(CFG.sae_release, l, device) for l in CFG.sae_layers}
-        contexts = load_fineweb_contexts(CFG.jlens_n_contexts)
+        sae_by_layer = {
+            l: load_sae(CFG.sae_release, l, device, hook_point=CFG.sae_hook_point)
+            for l in CFG.sae_layers
+        }
+        print(f"Streaming {CFG.jlens_n_contexts} contexts from FineWeb (sample-10BT)...")
+        contexts = load_context_corpus(CFG.jlens_n_contexts)
+        print(f"Got {len(contexts)} contexts.")
         counterfact = load_counterfact()
 
     bank = build_bank(model, tokenizer, sae_by_layer, device, contexts, counterfact)

@@ -47,6 +47,25 @@ from direction_source import pair_direction
 from protocol import alpha_over_norm
 
 
+def _resolve_alpha(alphas, layer):
+    """
+    alphas: EITHER a per-layer dict (CFG.stage2_alphas, as stored in Stage 4's split.json) OR a single float
+    (args.alt_alphas' entries in stage5_run.py, or an old-format split.json). Same convention as
+    stage4_train.build_training_examples -- a single alpha across a multi-layer loop is wrong in general
+    (layers 3/7 collapse above ~2, layers 19-27 stay coherent to ~6-7).
+    """
+    if isinstance(alphas, dict):
+        try:
+            return alphas[layer]
+        except KeyError:
+            raise KeyError(
+                f"No calibrated alpha entry for layer {layer!r} in the alphas dict "
+                f"(from split.json or CFG.stage2_alphas). If CFG.sae_layers gained a "
+                f"new layer, run alpha_sweep.py for it and add the entry."
+            )
+    return alphas
+
+
 def generate_over_texts(model, tokenizer, layer, direction, alpha, texts: List[str], elicitation_prompt: str,
                         device: str, n_trials: int, max_new_tokens: int, apply_hook: bool = True) -> List[str]:
     """`n_trials` generations for EACH input text, pooled in text order."""
@@ -59,11 +78,13 @@ def generate_over_texts(model, tokenizer, layer, direction, alpha, texts: List[s
 
 def evaluate_correlated(
     model, tokenizer, vectors, pairs: List[Tuple[str, str]], layers: List[int],
-    alpha: float, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
+    alphas, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
     candidate_labels: List[str] = None, provider=None, direction_source: str = "jspace",
     direction_seed: int = 0, activation_norms=None,
 ) -> List[dict]:
     """
+    alphas: per-layer dict OR a single float -- see _resolve_alpha.
+
     candidate_labels: the full set of labels the trained adapter could
     plausibly recite (e.g. every pair it was trained on) -- passed to
     exact_match_score's shotgun-listing check. Defaults to just the
@@ -81,6 +102,7 @@ def evaluate_correlated(
             d_xy = pair_direction(vectors, x, y, layer, direction_source, direction_seed)
             if d_xy is None:
                 continue
+            alpha = _resolve_alpha(alphas, layer)
 
             for label, sign in ((x, 1.0), (y, -1.0)):
                 texts = provider.eval_texts(label)
@@ -98,10 +120,11 @@ def evaluate_correlated(
 
 def evaluate_decorrelated(
     model, tokenizer, vectors, pairs: List[Tuple[str, str]], layers: List[int],
-    alpha: float, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
+    alphas, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
     candidate_labels: List[str] = None, provider=None, direction_source: str = "jspace",
     direction_seed: int = 0, activation_norms=None, n_boot: int = 2000, boot_seed: int = 0,
 ) -> List[dict]:
+    """alphas: per-layer dict OR a single float -- see _resolve_alpha."""
     provider = provider or get_input_provider("template")
     if candidate_labels is None:
         candidate_labels = list({label for pair in pairs for label in pair})
@@ -112,6 +135,7 @@ def evaluate_decorrelated(
             d_xy = pair_direction(vectors, x, y, layer, direction_source, direction_seed)
             if d_xy is None:
                 continue
+            alpha = _resolve_alpha(alphas, layer)
 
             texts_y, texts_x = provider.eval_texts(y), provider.eval_texts(x)
             # direction=X, input=Y   and   direction=Y, input=X

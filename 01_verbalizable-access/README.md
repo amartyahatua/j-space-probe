@@ -51,6 +51,11 @@ direction).
   scheme isn't fully published. Validate that your extracted J-space
   directions actually show the expected signature (low-variance,
   concentrated in middle layers) before trusting them as positive controls.
+- **`data.py`**'s context loader uses FineWeb's `sample-10BT` config, not the
+  unconfigured full corpus — the latter resolves to tens of thousands of
+  shard files and can stall for a long time on streaming-shuffle. If it's
+  still slow for you, try lowering the shuffle `buffer_size` further (or to
+  0) in `load_context_corpus`.
 - **`data.py`**'s CounterFact field names assume the
   `NeelNanda/counterfact-tracing` schema — check/adjust if you use a
   different release.

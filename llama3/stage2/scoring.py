@@ -21,30 +21,55 @@ from typing import List, Dict, Optional, Tuple
 
 def is_degenerate_repetition(text: str, min_repeats: int = 3) -> bool:
     """
-    True if `text` looks like a degenerate repetition loop (e.g. "Paris
-    Paris Paris Paris...") rather than a genuine report -- caught via
-    (a) the same word repeating min_repeats+ times consecutively, or
-    (b) one word dominating more than half the text even if not
-    strictly consecutive. Both patterns trivially satisfy a naive
-    whole-word match without being a coherent report.
+    True if `text` looks like a degenerate repetition loop rather than
+    a genuine report -- caught via three related patterns, all of
+    which trivially satisfy a naive whole-word target-concept match
+    without being a coherent report:
+      (a) the same whitespace-delimited word repeating min_repeats+
+          times consecutively (e.g. "What What What What"),
+      (b) one word dominating more than half the text even if not
+          strictly consecutive,
+      (c) a short substring repeating min_repeats+ times with NO
+          separating whitespace at all (e.g. "catcatcatcatcat",
+          "dogdogdogdogdogdog"). This is the pattern actually observed
+          at high steering alpha (see alpha_sweep.py runs on layer 19/
+          23/27 during the 2026-08 calibration pass): sampling gets
+          stuck re-emitting the same subword token with no space
+          between repeats, so the ENTIRE run parses as one "word"
+          under a whitespace split -- (a) and (b) alone silently miss
+          it, which is exactly how alpha=12's degenerate output could
+          have inflated exact_match_rate before this check existed.
     """
-    words = [w.strip(".,!?\"'") .lower() for w in text.strip().split()]
-    if len(words) < min_repeats:
-        return False
+    stripped = text.strip()
+    words = [w.strip(".,!?\"'") .lower() for w in stripped.split()]
 
-    max_run, run = 1, 1
-    for i in range(1, len(words)):
-        if words[i] == words[i - 1]:
-            run += 1
-            max_run = max(max_run, run)
-        else:
-            run = 1
-    if max_run >= min_repeats:
+    if len(words) >= min_repeats:
+        max_run, run = 1, 1
+        for i in range(1, len(words)):
+            if words[i] == words[i - 1]:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 1
+        if max_run >= min_repeats:
+            return True
+
+        from collections import Counter
+        most_common_count = Counter(words).most_common(1)[0][1]
+        if most_common_count / len(words) > 0.5:
+            return True
+
+    # (c) glued/no-space repetition: a short unit (1-12 chars) repeated
+    # min_repeats+ times back-to-back anywhere in the text. Case-
+    # insensitive since the sampler sometimes drifts capitalization
+    # mid-repeat (e.g. "DogdogDog"). Safe against false positives on
+    # genuine prose: natural English essentially never repeats an
+    # arbitrary short substring 3+ times with zero separating
+    # whitespace, so this only fires on the actual collapse pattern.
+    if re.search(r"(.{1," + str(12) + r"}?)\1{" + str(min_repeats - 1) + r",}", stripped, flags=re.IGNORECASE):
         return True
 
-    from collections import Counter
-    most_common_count = Counter(words).most_common(1)[0][1]
-    return most_common_count / len(words) > 0.5
+    return False
 
 
 def mentions_multiple_labels(text: str, candidate_labels: List[str], min_distinct: int = 2) -> bool:
@@ -88,6 +113,21 @@ def exact_match_score(
     (as most existing call sites do) to skip the shotgun-listing
     check entirely -- only pass it when the caller actually knows the
     full set of labels a given run's model could be reciting from.
+
+    NOTE on the glued-mention recovery below: plain \b-bounded
+    matching turns out to have the OPPOSITE problem from what it looks
+    like at first -- it already correctly scores 0 on pure repetition
+    spam like "catcatcatcat" (no word boundary exists mid-run between
+    identical glued copies, so \bcat\b never matches there at all).
+    But that same \b strictness also silently misses genuine, on-
+    target hits where the steering hook drops the token's leading-
+    space marker and glues it onto the previous word with no space --
+    e.g. "...currently thinking aboutFrance, the country" or "...the
+    upcomingItaly vs Spain football match", both seen repeatedly in
+    the alpha_sweep.py calibration output right in the good, near-
+    sweet-spot alpha range (not the collapse range). Those are real
+    verbalization hits that \btarget\b alone was silently scoring 0 --
+    an undercount in exactly the results you'd want to trust most.
     """
     if not target_concept:
         return None
@@ -95,8 +135,28 @@ def exact_match_score(
         return 0
     if candidate_labels and mentions_multiple_labels(report, candidate_labels):
         return 0
-    pattern = r"\b" + re.escape(target_concept.strip()) + r"\b"
-    return 1 if re.search(pattern, report, flags=re.IGNORECASE) else 0
+    target = target_concept.strip()
+    pattern = r"\b" + re.escape(target) + r"\b"
+    if re.search(pattern, report, flags=re.IGNORECASE):
+        return 1
+    # Recover the lowercase-into-Capitalized glue artifact for
+    # proper-noun targets only (Paris, Rome, France, Italy in this
+    # project's jspace token set). Requires the glue to occur at a
+    # lowercase-to-uppercase transition immediately before the target
+    # and a normal word boundary immediately after it -- specific
+    # enough not to become a blanket substring match (it would NOT,
+    # for example, rescue "cat" inside "category": no case transition
+    # there). Deliberately NOT extended to lowercase targets (dog,
+    # cat, happy, sad) -- there's no case signal to tell a genuine
+    # glued mention apart from an ordinary word that happens to
+    # contain the target as a substring (concatenate, indicate,
+    # category, vacation, ...), so those stay strict/\b-only and any
+    # undercount there has to be caught by human/blind judging instead.
+    if target[:1].isupper():
+        glued_pattern = r"(?<=[a-z])" + re.escape(target) + r"\b"
+        if re.search(glued_pattern, report):
+            return 1
+    return 0
 
 
 def score_reports(
