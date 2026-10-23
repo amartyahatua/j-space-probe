@@ -20,6 +20,7 @@ PEFT actually uses in its forward pass (a hook on a disconnected copy
 would silently never fire) before trusting this.
 """
 
+import random
 import torch
 from typing import List, Optional
 from peft import LoraConfig, get_peft_model
@@ -102,11 +103,40 @@ def train_stage4(
     lr: float = 1e-3,
     log_every: int = 10,
     max_grad_norm: float = 1.0,
+    seed: int = 0,
 ):
     """
     training_examples: [{"layer": int, "direction": Tensor, "alpha": float,
                           "prompt": str, "target_label": str}, ...]
+
+    Shuffles a fresh copy of training_examples at the start of EACH
+    epoch before iterating. This was missing before -- a real 10-epoch
+    Llama-3.1-8B-Instruct run without shuffling showed exactly why it
+    matters: build_training_examples() emits examples grouped into
+    long contiguous blocks (all of pair 1 across every layer, then all
+    of pair 2, then pair 3 -- same fixed order every single epoch).
+    Per-pair avg loss for that run: Paris/Rome converged to ~1.8 by
+    the end of epoch 0, then REGRESSED to 2.9-4.2 for epochs 2-7 and
+    never recovered below ~2.2 even by epoch 9; dog/cat and sad/happy
+    show the identical pattern (a good epoch 0, then a hard spike the
+    next time that block is revisited, then a persistent elevated
+    plateau for the rest of training). This is the textbook signature
+    of catastrophic interference in blocked/sequential multi-task
+    training: a small shared LoRA budget (r=8) has to "context-switch"
+    between three unrelated correlated-condition mappings, and without
+    interleaving, each pair's long uninterrupted run of gradient steps
+    partially overwrites what the previous pair's block just learned --
+    every epoch, not just once. The post-training sanity eval on that
+    exact run showed 0% match rate and garbage/empty output on the
+    FIRST pair/layer combo (which is what evaluate()'s old fixed
+    examples[:6] slice happened to check), consistent with this never
+    resolving by the end of training. Shuffling per epoch is the
+    standard fix for this failure mode -- it turns three long blocks
+    into an interleaved curriculum so the optimizer is pushed toward a
+    shared solution instead of three competing ones taking turns
+    overwriting each other.
     """
+    rng = random.Random(seed)
     optimizer = torch.optim.AdamW(
         [p for p in peft_model.parameters() if p.requires_grad], lr=lr
     )
@@ -114,14 +144,21 @@ def train_stage4(
     history = []
     step = 0
     for epoch in range(n_epochs):
+        epoch_examples = training_examples[:]
+        rng.shuffle(epoch_examples)
+
         epoch_losses = []
-        for ex in training_examples:
+        for ex in epoch_examples:
             loss = train_step(
                 peft_model, tokenizer, ex["layer"], ex["direction"], ex["alpha"],
                 ex["prompt"], ex["target_label"], device, optimizer, max_grad_norm=max_grad_norm,
             )
             epoch_losses.append(loss)
-            history.append({"epoch": epoch, "step": step, "loss": loss, "target_label": ex["target_label"]})
+            history.append({"epoch": epoch, "step": step, "loss": loss, "target_label": ex["target_label"],
+                             "layer": ex["layer"]})  # layer now recorded too -- needed to diagnose
+                                                      # per-(pair,layer) convergence the way this fix was
+                                                      # itself diagnosed, without re-deriving block offsets
+                                                      # from a fixed unshuffled order that no longer exists
             step += 1
             if log_every and step % log_every == 0:
                 print(f"  epoch {epoch} step {step}: loss={loss:.4f}", flush=True)

@@ -33,9 +33,29 @@ from scoring import exact_match_score
 from decorrelation import build_bipolar_direction, build_input_content, build_cell_prompt, direction_following_index
 
 
+def _resolve_alpha(alphas, layer):
+    """
+    alphas: EITHER a per-layer dict (CFG.stage2_alphas, as now stored in
+    Stage 4's split.json) OR a single float (args.alt_alphas' entries in
+    stage5_run.py, or an old-format split.json). Same convention as
+    stage4_train.py's build_training_examples -- see its docstring for
+    why a single alpha across a multi-layer loop is wrong in general.
+    """
+    if isinstance(alphas, dict):
+        try:
+            return alphas[layer]
+        except KeyError:
+            raise KeyError(
+                f"No calibrated alpha entry for layer {layer!r} in the alphas dict "
+                f"(from split.json or CFG.stage2_alphas). If CFG.sae_layers gained a "
+                f"new layer, run alpha_sweep.py for it and add the entry."
+            )
+    return alphas
+
+
 def evaluate_correlated(
     model, tokenizer, vectors, pairs: List[Tuple[str, str]], layers: List[int],
-    alpha: float, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
+    alphas, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
     candidate_labels: List[str] = None,
 ) -> List[dict]:
     """
@@ -45,6 +65,8 @@ def evaluate_correlated(
     labels in `pairs` if not given; pass the broader set explicitly
     when evaluating a trained adapter that might hedge across pairs
     outside the ones being tested here specifically.
+
+    alphas: per-layer dict OR a single float -- see _resolve_alpha.
     """
     if candidate_labels is None:
         candidate_labels = list({label for pair in pairs for label in pair})
@@ -56,6 +78,7 @@ def evaluate_correlated(
             if key_x not in vectors or key_y not in vectors:
                 continue
             d_xy = build_bipolar_direction(vectors[key_x], vectors[key_y])
+            alpha = _resolve_alpha(alphas, layer)
 
             for label, sign in ((x, 1.0), (y, -1.0)):
                 prompt = f"{build_input_content(label)}\n{elicitation_prompt}"
@@ -72,9 +95,10 @@ def evaluate_correlated(
 
 def evaluate_decorrelated(
     model, tokenizer, vectors, pairs: List[Tuple[str, str]], layers: List[int],
-    alpha: float, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
+    alphas, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
     candidate_labels: List[str] = None,
 ) -> List[dict]:
+    """alphas: per-layer dict OR a single float -- see _resolve_alpha."""
     if candidate_labels is None:
         candidate_labels = list({label for pair in pairs for label in pair})
 
@@ -85,6 +109,7 @@ def evaluate_decorrelated(
             if key_x not in vectors or key_y not in vectors:
                 continue
             d_xy = build_bipolar_direction(vectors[key_x], vectors[key_y])
+            alpha = _resolve_alpha(alphas, layer)
 
             prompt_input_y = build_cell_prompt(y, elicitation_prompt)  # direction=X, input=Y
             prompt_input_x = build_cell_prompt(x, elicitation_prompt)  # direction=Y, input=X

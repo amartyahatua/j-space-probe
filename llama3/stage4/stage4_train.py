@@ -80,7 +80,21 @@ TRAINING_INPUT_TEMPLATES = [
 # identical overfitting pattern in Stage 7.
 
 
-def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitation_prompt):
+def build_training_examples(vectors, train_pairs, train_layers, alphas, elicitation_prompt):
+    """
+    alphas: EITHER a per-layer dict (the normal case -- CFG.stage2_alphas,
+    the calibrated table from alpha_sweep.py) OR a single float (the
+    --alpha override / dry_run path, applied uniformly). train_layers
+    typically spans multiple depths at once (e.g. [3, 7, 19, 23] with
+    23/27 -- whichever is held out per --n_holdout_layers -- excluded),
+    and a single alpha across that range is exactly the miscalibration
+    the alpha_sweep.py calibration pass fixed for Stage 2/3: alpha=1.5
+    is right for layer 3 but inert-to-nothing by layer 19, while
+    alpha=6 is fine at layer 19 but already collapsing by layer 3/7.
+    Resolving per-layer here means each layer's training examples use
+    ITS calibrated alpha, not whichever one layer the single float
+    happened to be tuned for.
+    """
     examples = []
     for (x, y) in train_pairs:
         for layer in train_layers:
@@ -88,6 +102,19 @@ def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitati
             if key_x not in vectors or key_y not in vectors:
                 continue
             d_xy = build_bipolar_direction(vectors[key_x], vectors[key_y])
+
+            if isinstance(alphas, dict):
+                try:
+                    alpha = alphas[layer]
+                except KeyError:
+                    raise KeyError(
+                        f"No calibrated stage2_alphas entry for layer {layer!r}. If CFG.sae_layers "
+                        f"gained a new layer, run alpha_sweep.py for it and add the entry before "
+                        f"trusting a real Stage 4 run -- or pass --alpha to force a single value "
+                        f"across all layers (not recommended, see --help)."
+                    )
+            else:
+                alpha = alphas
 
             # correlated condition only: direction and input agree.
             # Multiple carrier templates per label -- see TRAINING_INPUT_TEMPLATES docstring.
@@ -103,8 +130,35 @@ def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitati
     return examples
 
 
-def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens=10):
-    """Quick sanity check: does the trained adapter now actually produce the label on TRAINING examples?"""
+def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens=10, max_eval=12):
+    """
+    Quick sanity check: does the trained adapter now actually produce
+    the label on TRAINING examples?
+
+    Samples up to max_eval examples STRATIFIED across every distinct
+    (target_label, layer) combo present -- not just the first max_eval
+    examples in list order. build_training_examples() emits examples
+    grouped pair-by-pair then layer-by-layer, so a plain examples[:N]
+    slice always checks the exact same single pair at its first layer
+    no matter how many other pairs/layers exist. That's exactly what
+    hid a real problem on a Llama-3.1-8B-Instruct run: the old
+    examples[:6] slice (always pair 1 / layer 3) reported 0% match
+    rate, which WAS a genuine and important finding, but told you
+    nothing about layers 7/19/23 or the other two pairs -- confirming
+    the adapter was broken more broadly required manually digging
+    through training_history.json's loss curve instead of this eval
+    just showing it directly.
+    """
+    if len(examples) > max_eval:
+        seen = set()
+        stratified = []
+        for ex in examples:
+            key = (ex["target_label"], ex["layer"])
+            if key not in seen:
+                seen.add(key)
+                stratified.append(ex)
+        examples = stratified[:max_eval]
+
     all_labels = list({ex["target_label"] for ex in examples})  # for shotgun-listing detection --
     # a report reciting several of these at once shouldn't count as a genuine match for any of them
     results = []
@@ -124,7 +178,12 @@ def main():
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--bank_dir", default="../stage1/direction_bank")
     parser.add_argument("--out_dir", default="stage4_adapter")
-    parser.add_argument("--alpha", type=float, default=None, help="Defaults to CFG.stage2_alpha.")
+    parser.add_argument("--alpha", type=float, default=None,
+                         help="Override: use this ONE alpha for every layer's training examples "
+                              "instead of the calibrated per-layer CFG.stage2_alphas lookup. Only "
+                              "for quick exploration -- a single alpha spanning layers 3-27 "
+                              "reproduces exactly the miscalibration the Stage 2 alpha_sweep.py "
+                              "calibration pass fixed. Leave unset for a real run.")
     parser.add_argument("--n_epochs", type=int, default=10,
                          help="Training examples are now 4x larger (multiple prompt templates per label, "
                               "see TRAINING_INPUT_TEMPLATES) -- fewer epochs needed for a similar total step "
@@ -146,7 +205,6 @@ def main():
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
-    alpha = args.alpha if args.alpha is not None else CFG.stage2_alpha
 
     if args.dry_run:
         from transformers import GPT2LMHeadModel, GPT2Config
@@ -168,6 +226,10 @@ def main():
         # independent of whatever CFG.model_name/--target_modules point to for a real run --
         # GPT-2 uses a fused c_attn Conv1D, not separate q_proj/k_proj/v_proj/o_proj Linears
         args.target_modules = ["c_attn"]
+        # Mock bank uses synthetic layers [2, 4], which aren't in CFG.stage2_alphas (that dict is
+        # keyed by the REAL bank's layers 3/7/19/23/27) -- always use a fixed placeholder alpha
+        # here regardless of --alpha, same reasoning as stage3_run.py's dry_run path.
+        alpha = args.alpha if args.alpha is not None else 4.0
     else:
         model, tokenizer = load_real_model(CFG.model_name, device, CFG.dtype)
         vectors, metadata = load_bank(args.bank_dir)
@@ -175,6 +237,9 @@ def main():
         layers = sorted({m["layer"] for m in metadata.values() if m["class"] == "jspace"})
         out_dir = args.out_dir
         n_epochs = args.n_epochs
+        # Per-layer calibrated dict by default (resolved per training example inside
+        # build_training_examples); --alpha overrides with a single value everywhere.
+        alpha = args.alpha if args.alpha is not None else CFG.stage2_alphas
 
     train_pairs, held_out_pairs, train_layers, held_out_layers = build_split(
         pairs, layers, args.n_holdout_pairs, args.n_holdout_layers
@@ -193,7 +258,8 @@ def main():
                             max_grad_norm=args.max_grad_norm)
 
     print("\nPost-training sanity eval on TRAINING examples (should now show high match rates):")
-    eval_results = evaluate(peft_model, tokenizer, examples[: min(6, len(examples))], device)
+    print("(stratified across every (label, layer) combo -- see evaluate()'s docstring for why)")
+    eval_results = evaluate(peft_model, tokenizer, examples, device)
     for r in eval_results:
         print(f"  target='{r['target_label']}' layer={r['layer']}: match_rate={r['match_rate']:.2f}")
 

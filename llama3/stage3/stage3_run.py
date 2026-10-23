@@ -98,7 +98,14 @@ def main():
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--bank_dir", default="../stage1/direction_bank")
     parser.add_argument("--out_dir", default="stage3_results")
-    parser.add_argument("--alpha", type=float, default=None, help="Defaults to CFG.stage2_alpha.")
+    parser.add_argument("--alpha", type=float, default=None,
+                         help="Override: use this ONE alpha for every layer instead of the "
+                              "calibrated per-layer CFG.stage2_alphas lookup. Only for quick "
+                              "exploration -- a single alpha spanning layers 3-27 reproduces "
+                              "exactly the miscalibration the Stage 2 alpha_sweep.py calibration "
+                              "pass fixed (layers 3/7 need ~1.5, layers 19-27 need ~6-6.5; no "
+                              "single value is coherent at one end without being inert at the "
+                              "other). Leave unset for a real run.")
     parser.add_argument("--n_trials", type=int, default=3)
     parser.add_argument("--max_new_tokens", type=int, default=20)
     parser.add_argument("--pairs", type=str, default=None,
@@ -106,7 +113,6 @@ def main():
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
-    alpha = args.alpha if args.alpha is not None else CFG.stage2_alpha
     pairs = json.loads(args.pairs) if args.pairs else DEFAULT_PAIRS
     pairs = [tuple(p) for p in pairs]
 
@@ -133,11 +139,30 @@ def main():
         pairs = pairs[:2]
         out_dir = "stage3_results_dryrun"
         n_trials, max_new_tokens = 2, 6
+        # Mock bank uses synthetic layers [2, 4], which aren't in CFG.stage2_alphas (that dict is
+        # keyed by the REAL bank's layers 3/7/19/23/27) -- a per-layer lookup would just KeyError
+        # here for no good reason, so the dry run always uses a fixed placeholder alpha regardless
+        # of --alpha. This path never touches real weights/results, so it doesn't need to be
+        # calibration-accurate, just fast and non-crashing.
+        alpha_for_layer = lambda layer: 4.0
     else:
         model, tokenizer = load_real_model(CFG.model_name, device, CFG.dtype)
         vectors, metadata = load_bank(args.bank_dir)
         out_dir = args.out_dir
         n_trials, max_new_tokens = args.n_trials, args.max_new_tokens
+
+        def alpha_for_layer(layer):
+            if args.alpha is not None:
+                return args.alpha
+            try:
+                return CFG.stage2_alphas[layer]
+            except KeyError:
+                raise KeyError(
+                    f"No calibrated stage2_alphas entry for layer {layer!r}. If CFG.sae_layers "
+                    f"gained a new layer, run alpha_sweep.py for it and add the entry to "
+                    f"CFG.stage2_alphas before trusting a real Stage 3 run -- or pass --alpha to "
+                    f"force a single value across all layers (not recommended, see --help)."
+                )
 
     layers = sorted({m["layer"] for m in metadata.values() if m["class"] == "jspace"})
     results = []
@@ -146,6 +171,7 @@ def main():
     for (x, y) in pairs:
         for layer in layers:
             i += 1
+            alpha = alpha_for_layer(layer)
             r = run_pair(model, tokenizer, vectors, metadata, layer, x, y, alpha,
                          CFG.stage2_prompt, n_trials, max_new_tokens, device)
             if r is None:
@@ -154,7 +180,7 @@ def main():
             results.append(r)
             raw_dfi = r["raw"]["dfi_overall"]
             orth_dfi = r["orthogonalized"]["dfi_overall"]
-            print(f"  [{i}/{total}] ({x},{y}) layer={layer}: "
+            print(f"  [{i}/{total}] ({x},{y}) layer={layer} alpha={alpha}: "
                   f"raw_dfi={raw_dfi} orth_dfi={orth_dfi} "
                   f"logit_lens={r['raw']['logit_lens_top_tokens']}", flush=True)
 

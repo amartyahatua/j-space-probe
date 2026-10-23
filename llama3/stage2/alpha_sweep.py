@@ -41,7 +41,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bank_dir", default="../stage1/direction_bank",
                          help="Load J-space directions from this existing bank. Ignored if --recompute is set.")
-    parser.add_argument("--layer", type=int, default=11)  # must be one of CFG.sae_layers ([3,7,11,15,19,23,27])
+    parser.add_argument("--layer", type=int, default=7)  # must be one of CFG.sae_layers ([3,7,11,15,19,23,27])
                                                             # to have bank entries -- 11 is the ~34%-depth layer,
                                                             # closest match to the old config's layer-12 default
     parser.add_argument("--alphas", type=float, nargs="+", default=[4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0])

@@ -92,8 +92,11 @@ def main():
     parser.add_argument("--layer", type=int, default=19)  # mid-point of CFG.sae_layers ([3,7,11,15,19,23,27]) for
                                                              # llama-3.1-8b-instruct's 32 layers
     parser.add_argument("--alpha", type=float, default=None,
-                         help="Defaults to CFG.stage2_alpha. UNVERIFIED placeholder for Llama-3.1-8B-Instruct -- "
-                              "re-run alpha_sweep.py before trusting a real run; see stage1/config.py docstring.")
+                         help="Defaults to CFG.stage2_alphas[--layer] -- the calibrated per-layer value "
+                              "from the alpha_sweep.py calibration pass (see stage1/config.py). Since "
+                              "this stage only ever runs at ONE layer per invocation (--layer, default "
+                              "19), a plain per-layer dict lookup is enough here -- no multi-layer loop "
+                              "like Stage 4/5, so no need to resolve alpha per-example.")
     parser.add_argument("--n_epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3,
                          help="Lowered from 5e-3 -- that value caused severe training instability in Stage 4 "
@@ -107,7 +110,21 @@ def main():
     parser.add_argument("--out_dir", default="stage7_results")
     args = parser.parse_args()
     if args.alpha is None:
-        args.alpha = CFG.stage2_alpha
+        if args.dry_run:
+            # dry_run's mock bank doesn't use the real sae_layers, so the calibrated dict
+            # (keyed by 3/7/19/23/27) may not cover --layer's default -- use a fixed
+            # placeholder alpha for the dry run regardless (see stage3/stage4's dry_run
+            # paths for the same reasoning).
+            args.alpha = 4.0
+        else:
+            try:
+                args.alpha = CFG.stage2_alphas[args.layer]
+            except KeyError:
+                raise KeyError(
+                    f"No calibrated stage2_alphas entry for layer {args.layer!r}. Run "
+                    f"alpha_sweep.py for this layer and add it to CFG.stage2_alphas, or pass "
+                    f"--alpha explicitly to override."
+                )
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
 

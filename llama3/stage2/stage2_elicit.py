@@ -53,8 +53,20 @@ def run_stage2(model, tokenizer, vectors, metadata, contexts, device):
         layer = meta["layer"]
         target_concept = infer_target_concept(key)
 
+        try:
+            alpha = CFG.stage2_alphas[layer]
+        except KeyError:
+            raise KeyError(
+                f"No calibrated stage2_alphas entry for layer {layer!r} (direction {key!r}). "
+                f"CFG.stage2_alphas only covers {sorted(CFG.stage2_alphas)} -- if CFG.sae_layers "
+                f"was changed, run alpha_sweep.py for the new layer and add its entry before "
+                f"trusting a real run. Deliberately not falling back to a default: an unswept "
+                f"layer silently reusing another layer's alpha is exactly the bug this dict "
+                f"replaced (see config.py's stage2_alphas docstring)."
+            )
+
         reports = elicit_reports(
-            model, tokenizer, layer, direction, CFG.stage2_alpha, CFG.stage2_prompt, device,
+            model, tokenizer, layer, direction, alpha, CFG.stage2_prompt, device,
             n_trials=CFG.stage2_n_trials, max_new_tokens=CFG.stage2_max_new_tokens,
             temperature=CFG.stage2_temperature,
         )
@@ -76,6 +88,10 @@ def run_stage2(model, tokenizer, vectors, metadata, contexts, device):
             "direction_key": key,
             "class": meta["class"],
             "layer": layer,
+            "alpha": alpha,   # per-layer calibrated value actually used -- recorded so a later
+                              # re-read of elicitation_results.json doesn't have to cross-reference
+                              # config.py (which may have since changed) to know what alpha a given
+                              # trial ran at.
             "target_concept": target_concept,
             "trials": trial_records,
             "exact_match_rate": match_rate,
@@ -85,7 +101,7 @@ def run_stage2(model, tokenizer, vectors, metadata, contexts, device):
         })
 
         rate_str = f"{match_rate:.2f}" if match_rate is not None else "n/a"
-        print(f"  [{i + 1}/{n}] {key}: match_rate={rate_str} jmag={jmag:.4f} "
+        print(f"  [{i + 1}/{n}] {key}: alpha={alpha} match_rate={rate_str} jmag={jmag:.4f} "
               f"ualign={ualign:.4f} wpart={wpart:.4f}", flush=True)
 
     return results, blind_records
