@@ -11,7 +11,12 @@ both were built from the same decorrelation.py functions, so their
 per-entry schema is identical apart from that one layer of nesting.
 """
 
+import os
+import sys
 from typing import List, Dict, Optional
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage1"))
+from protocol import bootstrap_ci, wilson_interval
 
 
 def _mean(vals: List[float]) -> Optional[float]:
@@ -21,8 +26,11 @@ def _mean(vals: List[float]) -> Optional[float]:
 
 def _flatten_stage3(stage3_results: List[dict], condition: str = "raw") -> List[dict]:
     """Stage 3 nests each entry under raw/orthogonalized; pull one condition out flat."""
-    return [{**{k: v for k, v in e.items() if k not in ("raw", "orthogonalized")}, **e[condition]}
-            for e in stage3_results]
+    # Entries that lack the requested condition are skipped (e.g. 'unembed_projected' for a pair whose direction
+    # collapsed on projection -- that is reported in the entry's own `unembed_diagnostics`, not silently averaged in).
+    skip_keys = ("raw", "orthogonalized", "unembed_projected")
+    return [{**{k: v for k, v in e.items() if k not in skip_keys}, **e[condition]}
+            for e in stage3_results if condition in e]
 
 
 def accuracy_vs_direction_and_input(decorrelated_entries: List[dict]) -> Dict:
@@ -35,22 +43,44 @@ def accuracy_vs_direction_and_input(decorrelated_entries: List[dict]) -> Dict:
     for e in decorrelated_entries:
         dir_scores += [e.get("p_dirX_matches_X"), e.get("p_dirY_matches_Y")]
         input_scores += [e.get("p_dirX_matches_Y_input"), e.get("p_dirY_matches_X_input")]
-    return {
+    out = {
         "accuracy_vs_direction": _mean(dir_scores),
         "accuracy_vs_input": _mean(input_scores),
         "n_entries": len(decorrelated_entries),
     }
+    # Pooled exact counts (entries produced by the camera-ready code carry them). The means above are means of
+    # per-entry rates; these are the integers behind them.
+    pooled = {"direction": [0, 0], "input": [0, 0]}
+    have_counts = False
+    for e in decorrelated_entries:
+        c = e.get("counts")
+        if not c:
+            continue
+        have_counts = True
+        for key, bucket in (("dirX_matches_X", "direction"), ("dirY_matches_Y", "direction"),
+                            ("dirX_matches_Y_input", "input"), ("dirY_matches_X_input", "input")):
+            pooled[bucket][0] += c[key]["k"]
+            pooled[bucket][1] += c[key]["n"]
+    if have_counts:
+        out["pooled_counts"] = {b: {"k": k, "n": n, "wilson95": list(wilson_interval(k, n))}
+                                for b, (k, n) in pooled.items()}
+    return out
 
 
 def direction_following_index_summary(decorrelated_entries: List[dict]) -> Dict:
     """Metric 2: direction-following index, aggregated."""
     vals = [e.get("dfi_overall") for e in decorrelated_entries]
     vals = [v for v in vals if v is not None]
+    boot = bootstrap_ci(vals, n_boot=2000, seed=0)
     return {
         "dfi_mean": _mean(vals),
         "dfi_min": min(vals) if vals else None,
         "dfi_max": max(vals) if vals else None,
         "n_entries": len(vals),
+        # 95% percentile interval from resampling ENTRIES (pair x layer cells). It reflects which cells were
+        # sampled, not training-seed variance -- for that, run several adapter seeds and use aggregate_seeds.py.
+        "dfi_ci95_over_entries": [boot["ci_low"], boot["ci_high"]],
+        "n_generations": sum(e.get("n_generations", 0) for e in decorrelated_entries),
     }
 
 
@@ -96,7 +126,20 @@ def ablation_summary(mechanism_check_entries: List[dict]) -> Dict:
     n_dir_necessary = sum(1 for e in mechanism_check_entries if e["ablation"]["direction_necessary"])
     n_input_necessary = sum(1 for e in mechanism_check_entries if e["ablation"]["input_necessary"])
     n = len(mechanism_check_entries)
+    no_hook = [e["ablation"].get("no_hook_control", {}).get("match_rate") for e in mechanism_check_entries]
+
+    def pooled(cond):
+        k = nn = 0
+        for e in mechanism_check_entries:
+            c = e["ablation"].get(cond, {}).get("counts")
+            if c:
+                k += c["k"]
+                nn += c["n"]
+        return {"k": k, "n": nn} if nn else None
+
     return {
+        "no_hook_control_mean": _mean(no_hook),
+        "pooled_counts": {c: pooled(c) for c in ("baseline", "ablate_direction", "ablate_input", "no_hook_control")},
         "baseline_mean": _mean(baseline),
         "ablate_direction_mean": _mean(ablate_dir),
         "ablate_input_mean": _mean(ablate_inp),

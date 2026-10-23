@@ -30,6 +30,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from config import CFG
 from build_direction_bank import load_real_model
 from decorrelation import build_bipolar_direction, build_input_content
+from input_provider import get_input_provider
+from direction_source import pair_direction
+from protocol import (seed_everything, write_protocol, decoding_settings, model_protocol,
+                      load_activation_norms)
 
 from generalization import evaluate_correlated, evaluate_decorrelated
 from mechanism_check import jacobian_alignment_pre_post, ablation_test
@@ -41,19 +45,22 @@ def load_bank(bank_dir: str):
     return vectors, metadata
 
 
-def run_mechanism_checks(peft_model, tokenizer, vectors, pairs, layers, alpha, elicitation_prompt, device, n_trials, max_new_tokens):
+def run_mechanism_checks(peft_model, tokenizer, vectors, pairs, layers, alpha, elicitation_prompt, device, n_trials,
+                          max_new_tokens, provider=None, direction_source="jspace", direction_seed=0,
+                          candidate_labels=None):
+    provider = provider or get_input_provider("template")
     results = []
     for (x, y) in pairs:
         for layer in layers:
-            key_x, key_y = f"jspace::{layer}::{x}", f"jspace::{layer}::{y}"
-            if key_x not in vectors or key_y not in vectors:
+            d_xy = pair_direction(vectors, x, y, layer, direction_source, direction_seed)
+            if d_xy is None:
                 continue
-            d_xy = build_bipolar_direction(vectors[key_x], vectors[key_y])
-            prompt = f"{build_input_content(x)}\n{elicitation_prompt}"
+            prompt = f"{provider.eval_texts(x)[0]}\n{elicitation_prompt}"
 
             jac = jacobian_alignment_pre_post(peft_model, tokenizer, layer, d_xy, prompt, x, device)
             ab = ablation_test(peft_model, tokenizer, layer, d_xy, alpha, x, elicitation_prompt, device,
-                                n_trials=n_trials, max_new_tokens=max_new_tokens)
+                                n_trials=n_trials, max_new_tokens=max_new_tokens, provider=provider,
+                                candidate_labels=candidate_labels)
             results.append({"pair": [x, y], "layer": layer, "jacobian_alignment": jac, "ablation": ab})
     return results
 
@@ -67,12 +74,23 @@ def main():
     parser.add_argument("--alt_alphas", type=float, nargs="+", default=[4.0, 6.0, 10.0, 12.0, 16.0])
     parser.add_argument("--n_trials", type=int, default=3)
     parser.add_argument("--max_new_tokens", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=0, help="Seeds generation sampling; also the bootstrap seed.")
+    parser.add_argument("--n_boot", type=int, default=2000)
+    parser.add_argument("--input_provider", choices=["template", "varied"], default=None,
+                         help="Defaults to whatever split.json says Stage 4 trained with. Overriding it (e.g. "
+                              "'varied' on a template-trained adapter) tests that adapter on unfamiliar passages.")
+    parser.add_argument("--activation_norms", default=None,
+                         help="activation_norms.json from stage1/activation_scale.py; logs alpha/||h|| per layer.")
+    parser.add_argument("--ablation_shotgun_check", action="store_true",
+                         help="Score the ablation cells with the shotgun-listing check too (stricter; changes "
+                              "ablation numbers vs. earlier runs, which scored without it).")
     parser.add_argument("--mechanism_check_max_pairs", type=int, default=2,
                          help="Mechanism checks are the most expensive part (ablation runs 3x generations "
                               "per combo); cap how many train pairs to run it on.")
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
+    seed_everything(args.seed)
 
     if args.dry_run:
         from transformers import GPT2LMHeadModel, GPT2Config
@@ -119,6 +137,15 @@ def main():
     train_layers, held_out_layers = split["train_layers"], split["held_out_layers"]
     alpha, prompt = split["alpha"], split["elicitation_prompt"]
 
+    # Stage 5 must evaluate with the inputs and directions Stage 4 trained on (older adapters: template + jspace).
+    provider = get_input_provider(args.input_provider or split.get("input_provider", "template"))
+    direction_source = split.get("direction_source", "jspace")
+    direction_seed = split.get("seed", 0)
+    activation_norms = load_activation_norms(args.activation_norms)
+    print(f"Input provider: {provider.name} (held-out phrasings unseen in training: {provider.heldout_is_unseen}) | "
+          f"direction source: {direction_source} | adapter seed: {direction_seed}")
+    common = dict(provider=provider, direction_source=direction_source, direction_seed=direction_seed)
+
     # Full label set across ALL pairs (train + held-out) -- passed to every
     # evaluate_* call below so shotgun-listing detection catches a report
     # reciting labels across DIFFERENT pairs (e.g. "happy Paris dog Rome"),
@@ -127,25 +154,31 @@ def main():
 
     print(f"1/5 Unseen directions: {held_out_pairs} x {train_layers} x alpha={alpha}")
     unseen_directions = evaluate_correlated(peft_model, tokenizer, vectors, held_out_pairs, train_layers,
-                                             alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels)
+                                             alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels,
+                                             activation_norms=activation_norms, **common)
 
     print(f"2/5 Unseen positions: {train_pairs} x {held_out_layers} x alpha={alpha}")
     unseen_positions = evaluate_correlated(peft_model, tokenizer, vectors, train_pairs, held_out_layers,
-                                            alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels)
+                                            alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels,
+                                            activation_norms=activation_norms, **common)
 
     print(f"3/5 Unseen coefficients: {train_pairs} x {train_layers} x alphas={args.alt_alphas}")
     unseen_coefficients = []
     for alt_alpha in args.alt_alphas:
         unseen_coefficients += evaluate_correlated(peft_model, tokenizer, vectors, train_pairs, train_layers,
-                                                     alt_alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels)
+                                                     alt_alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels,
+                                                     activation_norms=activation_norms, **common)
 
     print(f"4/5 Decorrelated conflict cells (decisive test): {train_pairs} x {train_layers} x alpha={alpha}")
     decorrelated = evaluate_decorrelated(peft_model, tokenizer, vectors, train_pairs, train_layers,
-                                          alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels)
+                                          alpha, prompt, device, n_trials, max_new_tokens, candidate_labels=all_labels,
+                                          activation_norms=activation_norms, n_boot=args.n_boot, boot_seed=args.seed,
+                                          **common)
 
     print(f"5/5 Mechanism check (H4): {train_pairs[:mech_max_pairs]} x {train_layers}")
     mechanism = run_mechanism_checks(peft_model, tokenizer, vectors, train_pairs[:mech_max_pairs], train_layers,
-                                      alpha, prompt, device, n_trials, max_new_tokens)
+                                      alpha, prompt, device, n_trials, max_new_tokens,
+                                      candidate_labels=all_labels if args.ablation_shotgun_check else None, **common)
 
     def summarize(results, key="match_rate"):
         vals = [r[key] for r in results if r.get(key) is not None]
@@ -167,7 +200,16 @@ def main():
             "mechanism_check": mechanism,
             "split_used": split,
         }, f, indent=2)
-    print(f"\nSaved stage5_results.json to {out_dir}/")
+    write_protocol(out_dir, "stage5", seed=args.seed, alpha=alpha, alt_alphas=args.alt_alphas,
+                   adapter_dir=args.adapter_dir, input_provider=provider.name,
+                   heldout_phrasings_unseen_in_training=provider.heldout_is_unseen,
+                   eval_texts={lab: provider.eval_texts(lab) for pair in (train_pairs + held_out_pairs) for lab in pair},
+                   direction_source=direction_source, adapter_seed=direction_seed, bootstrap_resamples=args.n_boot,
+                   ablation_scoring=("shotgun-listing check on" if args.ablation_shotgun_check
+                                     else "whole-word match only (no shotgun-listing check), as in earlier runs"),
+                   decoding=decoding_settings(n_trials, max_new_tokens, 0.8),
+                   activation_norms_file=args.activation_norms, **model_protocol(CFG, device))
+    print(f"\nSaved stage5_results.json (+ protocol.json) to {out_dir}/")
 
 
 if __name__ == "__main__":

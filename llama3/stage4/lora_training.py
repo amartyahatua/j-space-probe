@@ -102,6 +102,8 @@ def train_stage4(
     lr: float = 1e-3,
     log_every: int = 10,
     max_grad_norm: float = 1.0,
+    shuffle: bool = False,
+    seed: int = 0,
 ):
     """
     training_examples: [{"layer": int, "direction": Tensor, "alpha": float,
@@ -115,7 +117,14 @@ def train_stage4(
     step = 0
     for epoch in range(n_epochs):
         epoch_losses = []
-        for ex in training_examples:
+        order = list(range(len(training_examples)))
+        if shuffle:
+            # per-epoch reshuffle, deterministic given (seed, epoch). Off by default so that existing
+            # runs (fixed example order) stay reproducible; turn on to make different --seed values
+            # differ in data order as well as in LoRA initialisation.
+            import random as _random
+            _random.Random(seed * 1000 + epoch).shuffle(order)
+        for ex in (training_examples[i] for i in order):
             loss = train_step(
                 peft_model, tokenizer, ex["layer"], ex["direction"], ex["alpha"],
                 ex["prompt"], ex["target_label"], device, optimizer, max_grad_norm=max_grad_norm,

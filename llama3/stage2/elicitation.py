@@ -29,7 +29,13 @@ def elicit_reports(
     max_new_tokens: int = 30,
     temperature: float = 0.8,
     use_chat_template: bool = True,
+    apply_hook: bool = True,
 ) -> List[str]:
+    """
+    apply_hook=False skips the editing hook entirely (no intervention at all) -- distinct from
+    alpha=0.0, which still actively projects the direction's component out and sets it to zero.
+    Used by Stage 5's no-hook control; defaults to True so every existing call is unchanged.
+    """
     formatted_prompt = format_prompt_for_chat(tokenizer, prompt, use_chat_template)
     inputs = tokenizer(formatted_prompt, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -39,7 +45,7 @@ def elicit_reports(
 
     reports = []
     for _ in range(n_trials):
-        handle = apply_direction_editing(model, layer, direction, alpha)
+        handle = apply_direction_editing(model, layer, direction, alpha) if apply_hook else None
         try:
             with torch.no_grad():
                 out_ids = model.generate(
@@ -51,7 +57,8 @@ def elicit_reports(
                     eos_token_id=eos_id,
                 )
         finally:
-            handle.remove()
+            if handle is not None:
+                handle.remove()
         new_tokens = out_ids[0][prompt_len:]
         text = tokenizer.decode(new_tokens, skip_special_tokens=True)
         reports.append(text.strip())

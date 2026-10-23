@@ -31,8 +31,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from config import CFG
 from build_direction_bank import load_real_model
 from elicitation import elicit_reports
-from scoring import exact_match_score
+from scoring import exact_match_score, score_reports
 from decorrelation import build_bipolar_direction, build_input_content
+from input_provider import TRAINING_INPUT_TEMPLATES, get_input_provider   # TRAINING_INPUT_TEMPLATES re-exported
+from direction_source import pair_direction
+from protocol import seed_everything, write_protocol, decoding_settings, model_protocol
 from stage3_run import DEFAULT_PAIRS
 
 from lora_training import setup_lora_model, train_stage4
@@ -61,46 +64,47 @@ def build_split(pairs, layers, n_holdout_pairs: int, n_holdout_layers: int):
     return train_pairs, held_out_pairs, train_layers, held_out_layers
 
 
-TRAINING_INPUT_TEMPLATES = [
-    "A note nearby reads: \"{concept}\".",
-    "Someone just mentioned {concept}.",
-    "The word written on the page is {concept}.",
-    "A sign nearby says {concept}.",
-]
-# Multiple templates per label instead of Stage 4's original single fixed
-# sentence, repeated identically every epoch. Five real training runs on
-# Qwen2 showed increasingly severe instability with more epochs on that
-# narrow, trivially-memorizable dataset -- including one run where an
-# entire epoch's loss spiked simultaneously across every example, and
-# another where the SAME hyperparameters produced completely different
-# (even inverted) per-label convergence than a prior run, indicating the
-# problem was overfitting/instability from too little genuine variation
-# in the training data, not epoch count. This mirrors the exact fix
-# (covert_cognition.py's multiple TRAIN phrasings) that resolved the
-# identical overfitting pattern in Stage 7.
+# TRAINING_INPUT_TEMPLATES now lives in stage3/input_provider.py (re-exported above for back-compat), together with
+# the `varied` provider used for the "never forced to read" control. See that module's docstring for why the
+# default is several carrier templates per label (Stage 4 instability fix) and what `varied` changes.
 
 
-def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitation_prompt):
+def build_training_examples(vectors, train_pairs, train_layers, alpha, elicitation_prompt,
+                            provider=None, direction_source="jspace", direction_seed=0):
+    """
+    Correlated condition only: direction and input agree. With the default TemplateInputs provider and
+    direction_source="jspace" this reproduces the original example list exactly (same order).
+    """
+    provider = provider or get_input_provider("template")
     examples = []
     for (x, y) in train_pairs:
         for layer in train_layers:
-            key_x, key_y = f"jspace::{layer}::{x}", f"jspace::{layer}::{y}"
-            if key_x not in vectors or key_y not in vectors:
+            d_xy = pair_direction(vectors, x, y, layer, direction_source, direction_seed)
+            if d_xy is None:
                 continue
-            d_xy = build_bipolar_direction(vectors[key_x], vectors[key_y])
 
-            # correlated condition only: direction and input agree.
-            # Multiple carrier templates per label -- see TRAINING_INPUT_TEMPLATES docstring.
-            for template in TRAINING_INPUT_TEMPLATES:
+            xs, ys = provider.train_texts(x), provider.train_texts(y)
+            for i in range(max(len(xs), len(ys))):
                 examples.append({
                     "layer": layer, "direction": d_xy, "alpha": alpha,
-                    "prompt": f"{template.format(concept=x)}\n{elicitation_prompt}", "target_label": x,
+                    "prompt": f"{xs[i % len(xs)]}\n{elicitation_prompt}", "target_label": x,
                 })
                 examples.append({
                     "layer": layer, "direction": d_xy, "alpha": -alpha,
-                    "prompt": f"{template.format(concept=y)}\n{elicitation_prompt}", "target_label": y,
-            })
+                    "prompt": f"{ys[i % len(ys)]}\n{elicitation_prompt}", "target_label": y,
+                })
     return examples
+
+
+def select_eval_examples(examples):
+    """One example per distinct target label (first occurrence). The old `examples[:6]` slice covered
+    only the first pair, so the post-training sanity check silently never looked at the other labels."""
+    seen, picked = set(), []
+    for ex in examples:
+        if ex["target_label"] not in seen:
+            seen.add(ex["target_label"])
+            picked.append(ex)
+    return picked
 
 
 def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens=10):
@@ -113,9 +117,9 @@ def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens
             peft_model, tokenizer, ex["layer"], ex["direction"], ex["alpha"], ex["prompt"], device,
             n_trials=n_trials, max_new_tokens=max_new_tokens,
         )
-        matches = [exact_match_score(r, ex["target_label"], candidate_labels=all_labels) for r in reports]
-        rate = sum(matches) / len(matches)
-        results.append({"target_label": ex["target_label"], "layer": ex["layer"], "match_rate": rate, "reports": reports})
+        counts = score_reports(reports, ex["target_label"], candidate_labels=all_labels)
+        results.append({"target_label": ex["target_label"], "layer": ex["layer"], "match_rate": counts["rate"],
+                        "counts": counts, "reports": reports})
     return results
 
 
@@ -141,12 +145,24 @@ def main():
     parser.add_argument("--target_modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj"],
                          help="LoRA target module names. Qwen2/Llama/Gemma-2 family: "
                               "['q_proj','k_proj','v_proj','o_proj'] (default). GPT-2 family: ['c_attn'].")
+    parser.add_argument("--seed", type=int, default=0,
+                         help="Seeds LoRA initialisation and sampling (and, with --shuffle, data order). "
+                              "Run 3+ seeds for the camera-ready intervals.")
+    parser.add_argument("--shuffle", action="store_true", help="Reshuffle training examples every epoch (seeded).")
+    parser.add_argument("--input_provider", choices=["template", "varied"], default="template",
+                         help="template = existing 4 label-bearing carrier sentences. varied = the Stage 7 recipe "
+                              "(several passages per concept that never name it; held-out phrasings for Stage 5).")
+    parser.add_argument("--direction_source", choices=["jspace", "random"], default="jspace",
+                         help="random = train the reporter on a seeded random unit direction per (pair, layer) "
+                              "with the identical recipe: the negative-control baseline.")
     parser.add_argument("--n_holdout_pairs", type=int, default=1)
     parser.add_argument("--n_holdout_layers", type=int, default=1)
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
     alpha = args.alpha if args.alpha is not None else CFG.stage2_alpha
+    seed_everything(args.seed)
+    provider = get_input_provider(args.input_provider)
 
     if args.dry_run:
         from transformers import GPT2LMHeadModel, GPT2Config
@@ -158,7 +174,7 @@ def main():
 
         vectors = {}
         for layer in [2, 4]:
-            for tok in ["Paris", "Rome", "dog", "happy", "sad", "France", "Italy"]:
+            for tok in ["Paris", "Rome", "dog", "cat", "happy", "sad", "France", "Italy"]:
                 vectors[f"jspace::{layer}::{tok}"] = torch.randn(32)
         pairs = DEFAULT_PAIRS
         layers = [2, 4]
@@ -182,7 +198,9 @@ def main():
     print(f"Train pairs: {train_pairs}  |  held-out pairs: {held_out_pairs}")
     print(f"Train layers: {train_layers}  |  held-out layers: {held_out_layers}")
 
-    examples = build_training_examples(vectors, train_pairs, train_layers, alpha, CFG.stage2_prompt)
+    examples = build_training_examples(vectors, train_pairs, train_layers, alpha, CFG.stage2_prompt,
+                                       provider=provider, direction_source=args.direction_source,
+                                       direction_seed=args.seed)
     print(f"Built {len(examples)} correlated-condition training examples "
           f"({len(train_pairs)} pairs x {len(train_layers)} layers x 2 labels)")
 
@@ -190,12 +208,13 @@ def main():
     peft_model.print_trainable_parameters()
 
     history = train_stage4(peft_model, tokenizer, examples, device, n_epochs=n_epochs, lr=args.lr,
-                            max_grad_norm=args.max_grad_norm)
+                            max_grad_norm=args.max_grad_norm, shuffle=args.shuffle, seed=args.seed)
 
-    print("\nPost-training sanity eval on TRAINING examples (should now show high match rates):")
-    eval_results = evaluate(peft_model, tokenizer, examples[: min(6, len(examples))], device)
+    print("\nPost-training sanity eval on TRAINING examples, one per label (should now show high match rates):")
+    eval_results = evaluate(peft_model, tokenizer, select_eval_examples(examples), device)
     for r in eval_results:
-        print(f"  target='{r['target_label']}' layer={r['layer']}: match_rate={r['match_rate']:.2f}")
+        c = r["counts"]
+        print(f"  target='{r['target_label']}' layer={r['layer']}: match_rate={r['match_rate']:.2f} ({c['k']}/{c['n']})")
 
     os.makedirs(out_dir, exist_ok=True)
     peft_model.save_pretrained(out_dir)  # saves only the small LoRA weights, not the base model
@@ -204,12 +223,22 @@ def main():
             "train_pairs": train_pairs, "held_out_pairs": held_out_pairs,
             "train_layers": train_layers, "held_out_layers": held_out_layers,
             "alpha": alpha, "elicitation_prompt": CFG.stage2_prompt,
+            # Stage 5 reads these so it evaluates with the SAME inputs and directions the adapter trained on
+            "seed": args.seed, "input_provider": args.input_provider, "direction_source": args.direction_source,
+            "n_epochs": n_epochs, "lr": args.lr, "max_grad_norm": args.max_grad_norm, "shuffle": args.shuffle,
+            "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "target_modules": args.target_modules,
         }, f, indent=2)
     with open(os.path.join(out_dir, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
     with open(os.path.join(out_dir, "training_eval.json"), "w") as f:
         json.dump(eval_results, f, indent=2)
-    print(f"\nSaved adapter + split.json + training_history.json + training_eval.json to {out_dir}/")
+    write_protocol(out_dir, "stage4", seed=args.seed, alpha=alpha, n_epochs=n_epochs, lr=args.lr,
+                   max_grad_norm=args.max_grad_norm, shuffle=args.shuffle, input_provider=args.input_provider,
+                   direction_source=args.direction_source,
+                   training_texts={lab: provider.train_texts(lab) for pair in train_pairs for lab in pair},
+                   n_training_examples=len(examples), sanity_eval_decoding=decoding_settings(3, 10, 0.8),
+                   **model_protocol(CFG, device))
+    print(f"\nSaved adapter + split.json + training_history.json + training_eval.json + protocol.json to {out_dir}/")
 
 
 if __name__ == "__main__":
