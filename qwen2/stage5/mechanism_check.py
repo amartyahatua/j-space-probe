@@ -12,14 +12,18 @@ against a real trained adapter before building this: enabled vs.
 disabled outputs were identical pre-training, and measurably
 different -- max diff 0.79 -- after 20 training steps).
 
-ablation_test operationalizes "ablate the direction" as clamping its
-component to exactly zero (apply_direction_editing(..., alpha=0.0)),
-matching standard mechanistic-interpretability usage: an active null
-intervention on that specific component, not simply skipping the
-hook and leaving the activation's natural (unknown) value in place.
-"ablate the input" replaces the input-content sentence with the bare
-elicitation prompt -- no concept-bearing text at all -- while the
-direction stays clamped normally.
+ablation_test runs FOUR conditions; their exact definitions (also in
+llama3/PROTOCOL.md, because reviewers asked for them to be stated once, precisely):
+
+  baseline          input text present, direction clamped to +/-alpha.
+  direction ablation  input text present, direction clamped to alpha = 0: the hook is ACTIVE, the activation's
+                    current component along the direction is projected out and set to exactly zero
+                    (apply_direction_editing(..., alpha=0.0)) -- an active null intervention on that component.
+  input ablation    the input-content sentence/passage is replaced by the bare elicitation prompt (no
+                    concept-bearing text at all) while the direction stays clamped at +/-alpha.
+  no-hook control   input text present, the hook is entirely ABSENT (apply_hook=False): no projection, no
+                    clamp. Distinct from direction ablation: a model that reacts to "something was edited
+                    here" regardless of its value would pass a direction-ablation check but not this one.
 """
 
 import torch
@@ -31,8 +35,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage3"))
 
 from elicitation import elicit_reports
-from scoring import exact_match_score
+from scoring import exact_match_score, score_reports
 from decorrelation import build_input_content
+from input_provider import get_input_provider
+from generalization import generate_over_texts
 
 # --- make stage1/ importable (model_utils) ---
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage1"))
@@ -84,27 +90,46 @@ def jacobian_alignment_pre_post(peft_model, tokenizer, layer: int, direction: to
 def ablation_test(
     peft_model, tokenizer, layer: int, direction: torch.Tensor, alpha: float,
     x_concept: str, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
+    provider=None, candidate_labels=None,
 ) -> dict:
-    normal_prompt = f"{build_input_content(x_concept)}\n{elicitation_prompt}"
-    ablated_input_prompt = elicitation_prompt  # no concept-bearing input content at all
+    """
+    Four-condition ablation (definitions in the module docstring). With the default TemplateInputs provider
+    this is the original test plus the no-hook control and exact counts; with a provider that has several
+    held-out texts, every text gets `n_trials` generations and reports are pooled. The input-ablated cell has
+    no input text, so it is given n_trials * n_texts generations from the bare prompt to keep n comparable.
+    candidate_labels=None reproduces the original scoring (no shotgun-listing check) -- see PROTOCOL.md.
+    """
+    provider = provider or get_input_provider("template")
+    texts = provider.eval_texts(x_concept)
 
-    def rate(direction_alpha, prompt):
-        reports = elicit_reports(peft_model, tokenizer, layer, direction, direction_alpha, prompt, device,
-                                  n_trials=n_trials, max_new_tokens=max_new_tokens)
-        scores = [s for s in (exact_match_score(r, x_concept) for r in reports) if s is not None]
-        return (sum(scores) / len(scores) if scores else None), reports
+    def run(direction_alpha, with_input=True, apply_hook=True):
+        if with_input:
+            reports = generate_over_texts(peft_model, tokenizer, layer, direction, direction_alpha, texts,
+                                          elicitation_prompt, device, n_trials, max_new_tokens, apply_hook=apply_hook)
+        else:  # no concept-bearing input at all
+            reports = elicit_reports(peft_model, tokenizer, layer, direction, direction_alpha, elicitation_prompt,
+                                     device, n_trials=n_trials * len(texts), max_new_tokens=max_new_tokens,
+                                     apply_hook=apply_hook)
+        counts = score_reports(reports, x_concept, candidate_labels=candidate_labels)
+        return counts["rate"], reports, counts
 
-    baseline_rate, baseline_reports = rate(alpha, normal_prompt)
-    ablate_direction_rate, ablate_direction_reports = rate(0.0, normal_prompt)     # direction zeroed, input intact
-    ablate_input_rate, ablate_input_reports = rate(alpha, ablated_input_prompt)    # direction intact, input removed
+    baseline_rate, baseline_reports, baseline_counts = run(alpha)
+    ablate_direction_rate, ablate_direction_reports, ablate_direction_counts = run(0.0)
+    ablate_input_rate, ablate_input_reports, ablate_input_counts = run(alpha, with_input=False)
+    no_hook_rate, no_hook_reports, no_hook_counts = run(alpha, apply_hook=False)
+
+    def lower(a, b):
+        return a is not None and b is not None and a < b
 
     return {
-        "x_concept": x_concept, "layer": layer, "alpha": alpha,
-        "baseline": {"match_rate": baseline_rate, "reports": baseline_reports},
-        "ablate_direction": {"match_rate": ablate_direction_rate, "reports": ablate_direction_reports},
-        "ablate_input": {"match_rate": ablate_input_rate, "reports": ablate_input_reports},
-        "direction_necessary": (baseline_rate is not None and ablate_direction_rate is not None
-                                 and ablate_direction_rate < baseline_rate),
-        "input_necessary": (baseline_rate is not None and ablate_input_rate is not None
-                             and ablate_input_rate < baseline_rate),
+        "x_concept": x_concept, "layer": layer, "alpha": alpha, "n_input_texts": len(texts),
+        "baseline": {"match_rate": baseline_rate, "counts": baseline_counts, "reports": baseline_reports},
+        "ablate_direction": {"match_rate": ablate_direction_rate, "counts": ablate_direction_counts,
+                             "reports": ablate_direction_reports},
+        "ablate_input": {"match_rate": ablate_input_rate, "counts": ablate_input_counts, "reports": ablate_input_reports},
+        "no_hook_control": {"match_rate": no_hook_rate, "counts": no_hook_counts, "reports": no_hook_reports},
+        "direction_necessary": lower(ablate_direction_rate, baseline_rate),
+        "input_necessary": lower(ablate_input_rate, baseline_rate),
+        "hook_presence_alone_sufficient": (baseline_rate is not None and no_hook_rate is not None
+                                            and no_hook_rate >= baseline_rate),
     }

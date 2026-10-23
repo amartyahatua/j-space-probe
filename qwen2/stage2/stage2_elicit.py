@@ -26,10 +26,13 @@ import torch
 # --- make stage1/ importable from here (see editing.py for rationale) ---
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage1"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage3"))
 
 from config import CFG
 from elicitation import elicit_reports
-from scoring import exact_match_score, infer_target_concept, export_for_blind_judging
+from scoring import exact_match_score, score_reports, infer_target_concept, export_for_blind_judging
+from confounds import project_out_unembedding
+from protocol import seed_everything, write_protocol, decoding_settings, model_protocol
 from covariates import jacobian_magnitude, unembedding_alignment, build_jspace_basis, workspace_participation
 
 
@@ -39,16 +42,18 @@ def load_bank(bank_dir: str):
     return vectors, metadata
 
 
-def run_stage2(model, tokenizer, vectors, metadata, contexts, device):
+def run_stage2(model, tokenizer, vectors, metadata, contexts, device,
+               unembed_control=False, fold_final_norm=True, classes=None):
     bank_for_basis = {k: {"class": v["class"], "layer": v["layer"], "vector": vectors[k]} for k, v in metadata.items()}
     layers = sorted({v["layer"] for v in metadata.values()})
     jspace_basis = {l: build_jspace_basis(bank_for_basis, l) for l in layers}
 
     results = []
     blind_records = []
-    n = len(metadata)
+    items = [(k, m) for k, m in metadata.items() if classes is None or m["class"] in classes]
+    n = len(items)
 
-    for i, (key, meta) in enumerate(metadata.items()):
+    for i, (key, meta) in enumerate(items):
         direction = vectors[key]
         layer = meta["layer"]
         target_concept = infer_target_concept(key)
@@ -71,6 +76,28 @@ def run_stage2(model, tokenizer, vectors, metadata, contexts, device):
 
         matches = [r["exact_match"] for r in trial_records if r["exact_match"] is not None]
         match_rate = sum(matches) / len(matches) if matches else None
+        counts = score_reports(reports, target_concept)     # exact k/n behind exact_match_rate
+        alpha = CFG.stage2_alpha                              # single alpha in this folder (matches the elicit call above)
+
+        # Output-pathway control: same direction with the label tokens' unembedding readout projected out.
+        # The projected set is class-agnostic (every CFG.jlens_target_tokens label) so J-lens, SAE, probe and
+        # random directions are all stripped of the SAME logit-path component -- the comparison the reviewer
+        # asked for (J-lens unembedding_alignment ~0.57 vs ~0.11-0.20 for controls).
+        unembed_block = None
+        if unembed_control:
+            try:
+                d_proj, diag = project_out_unembedding(direction, model, tokenizer,
+                                                        list(CFG.jlens_target_tokens), fold_final_norm)
+                reports_p = elicit_reports(
+                    model, tokenizer, layer, d_proj, alpha, CFG.stage2_prompt, device,
+                    n_trials=CFG.stage2_n_trials, max_new_tokens=CFG.stage2_max_new_tokens,
+                    temperature=CFG.stage2_temperature,
+                )
+                counts_p = score_reports(reports_p, target_concept)
+                unembed_block = {"reports": reports_p, "counts": counts_p,
+                                 "exact_match_rate": counts_p["rate"], "diagnostics": diag}
+            except ValueError as e:
+                unembed_block = {"collapsed": True, "reason": str(e)}
 
         results.append({
             "direction_key": key,
@@ -79,6 +106,8 @@ def run_stage2(model, tokenizer, vectors, metadata, contexts, device):
             "target_concept": target_concept,
             "trials": trial_records,
             "exact_match_rate": match_rate,
+            "counts": counts,
+            "unembed_projected": unembed_block,
             "jacobian_magnitude": jmag,
             "unembedding_alignment": ualign,
             "workspace_participation": wpart,
@@ -128,9 +157,18 @@ def main():
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--bank_dir", default=CFG.output_dir)
     parser.add_argument("--out_dir", default=CFG.stage2_output_dir)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--unembed_control", action="store_true",
+                         help="Also elicit on each direction with the unembedding readout of every "
+                              "CFG.jlens_target_tokens label projected out (stored under 'unembed_projected').")
+    parser.add_argument("--no_fold_final_norm", action="store_true")
+    parser.add_argument("--classes", nargs="+", default=None,
+                         help="Restrict to these bank classes (jspace sae probe random random_in_span...). "
+                              "Default: all. Handy to halve cost on an 8B model: --classes jspace random.")
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
+    seed_everything(args.seed)
 
     if args.dry_run:
         from transformers import GPT2LMHeadModel, GPT2Config
@@ -158,9 +196,15 @@ def main():
         out_dir = args.out_dir
 
     results, blind_records = run_stage2(
-        model, tokenizer, vectors, metadata, contexts[: CFG.stage2_covariate_n_contexts], device
+        model, tokenizer, vectors, metadata, contexts[: CFG.stage2_covariate_n_contexts], device,
+        unembed_control=args.unembed_control, fold_final_norm=not args.no_fold_final_norm, classes=args.classes,
     )
     save_results(results, blind_records, out_dir)
+    write_protocol(out_dir, "stage2", seed=args.seed, alpha=CFG.stage2_alpha, classes=args.classes or "all",
+                   decoding=decoding_settings(CFG.stage2_n_trials, CFG.stage2_max_new_tokens, CFG.stage2_temperature,
+                                             use_chat_template=CFG.use_chat_template),
+                   unembed_control=args.unembed_control, fold_final_norm=not args.no_fold_final_norm,
+                   n_directions=len(results), **model_protocol(CFG, device))
 
 
 if __name__ == "__main__":

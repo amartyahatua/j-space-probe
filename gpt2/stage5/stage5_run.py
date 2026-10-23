@@ -30,8 +30,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from config import CFG
 from build_direction_bank import load_real_model
 from decorrelation import build_bipolar_direction, build_input_content
+from protocol import seed_everything, write_protocol, decoding_settings, model_protocol, load_activation_norms
 
 from generalization import evaluate_correlated, evaluate_decorrelated
+from scoring import SCORING_RULE
 from mechanism_check import jacobian_alignment_pre_post, ablation_test
 
 
@@ -70,9 +72,14 @@ def main():
     parser.add_argument("--mechanism_check_max_pairs", type=int, default=2,
                          help="Mechanism checks are the most expensive part (ablation runs 3x generations "
                               "per combo); cap how many train pairs to run it on.")
+    parser.add_argument("--seed", type=int, default=0, help="Seeds generation sampling; also the bootstrap seed.")
+    parser.add_argument("--n_boot", type=int, default=2000, help="Bootstrap resamples for per-entry DFI intervals.")
+    parser.add_argument("--activation_norms", default=None,
+                         help="activation_norms.json from stage1/activation_scale.py; logs alpha/||h|| per layer.")
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
+    seed_everything(args.seed)
 
     if args.dry_run:
         from transformers import GPT2LMHeadModel, GPT2Config
@@ -118,24 +125,29 @@ def main():
     held_out_pairs = [tuple(p) for p in split["held_out_pairs"]]
     train_layers, held_out_layers = split["train_layers"], split["held_out_layers"]
     alpha, prompt = split["alpha"], split["elicitation_prompt"]
+    activation_norms = load_activation_norms(args.activation_norms)
 
     print(f"1/5 Unseen directions: {held_out_pairs} x {train_layers} x alpha={alpha}")
     unseen_directions = evaluate_correlated(peft_model, tokenizer, vectors, held_out_pairs, train_layers,
-                                             alpha, prompt, device, n_trials, max_new_tokens)
+                                             alpha, prompt, device, n_trials, max_new_tokens,
+                                             activation_norms=activation_norms)
 
     print(f"2/5 Unseen positions: {train_pairs} x {held_out_layers} x alpha={alpha}")
     unseen_positions = evaluate_correlated(peft_model, tokenizer, vectors, train_pairs, held_out_layers,
-                                            alpha, prompt, device, n_trials, max_new_tokens)
+                                            alpha, prompt, device, n_trials, max_new_tokens,
+                                            activation_norms=activation_norms)
 
     print(f"3/5 Unseen coefficients: {train_pairs} x {train_layers} x alphas={args.alt_alphas}")
     unseen_coefficients = []
     for alt_alpha in args.alt_alphas:
         unseen_coefficients += evaluate_correlated(peft_model, tokenizer, vectors, train_pairs, train_layers,
-                                                     alt_alpha, prompt, device, n_trials, max_new_tokens)
+                                                     alt_alpha, prompt, device, n_trials, max_new_tokens,
+                                                     activation_norms=activation_norms)
 
     print(f"4/5 Decorrelated conflict cells (decisive test): {train_pairs} x {train_layers} x alpha={alpha}")
     decorrelated = evaluate_decorrelated(peft_model, tokenizer, vectors, train_pairs, train_layers,
-                                          alpha, prompt, device, n_trials, max_new_tokens)
+                                          alpha, prompt, device, n_trials, max_new_tokens,
+                                          activation_norms=activation_norms, n_boot=args.n_boot, boot_seed=args.seed)
 
     print(f"5/5 Mechanism check (H4): {train_pairs[:mech_max_pairs]} x {train_layers}")
     mechanism = run_mechanism_checks(peft_model, tokenizer, vectors, train_pairs[:mech_max_pairs], train_layers,
@@ -145,7 +157,15 @@ def main():
         vals = [r[key] for r in results if r.get(key) is not None]
         return sum(vals) / len(vals) if vals else None
 
+    def pooled(results):
+        """Pooled k/n over every generation in these rows (a mean of per-row rates is NOT k/n of the rows)."""
+        k = sum(r["counts"]["k"] for r in results if r.get("counts"))
+        n = sum(r["counts"]["n"] for r in results if r.get("counts"))
+        return f"{k}/{n}"
+
     print()
+    print(f"Pooled generations (k/n): unseen_directions {pooled(unseen_directions)} | "
+          f"unseen_positions {pooled(unseen_positions)} | unseen_coefficients {pooled(unseen_coefficients)}")
     print(f"Summary: unseen_directions avg match_rate = {summarize(unseen_directions)}")
     print(f"Summary: unseen_positions avg match_rate = {summarize(unseen_positions)}")
     print(f"Summary: unseen_coefficients avg match_rate = {summarize(unseen_coefficients)}")
@@ -161,7 +181,13 @@ def main():
             "mechanism_check": mechanism,
             "split_used": split,
         }, f, indent=2)
-    print(f"\nSaved stage5_results.json to {out_dir}/")
+    write_protocol(out_dir, "stage5", seed=args.seed, alpha=alpha, alt_alphas=args.alt_alphas,
+                   adapter_dir=args.adapter_dir, bootstrap_resamples=args.n_boot,
+                   eval_input_template='A note nearby reads: "{concept}".',
+                   ablation_scoring="whole-word match only (as in earlier runs)",
+                   decoding=decoding_settings(n_trials, max_new_tokens, 0.8, use_chat_template=False, scoring=SCORING_RULE),
+                   activation_norms_file=args.activation_norms, **model_protocol(CFG, device))
+    print(f"\nSaved stage5_results.json (+ protocol.json) to {out_dir}/")
 
 
 if __name__ == "__main__":

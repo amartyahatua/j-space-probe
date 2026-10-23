@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from config import CFG
 from build_direction_bank import load_real_model
 from elicitation import elicit_reports
-from scoring import exact_match_score
+from scoring import exact_match_score, score_reports
+from protocol import seed_everything, write_protocol, decoding_settings, model_protocol
 from decorrelation import build_bipolar_direction, build_input_content
 from stage3_run import DEFAULT_PAIRS
 
@@ -113,9 +114,9 @@ def evaluate(peft_model, tokenizer, examples, device, n_trials=3, max_new_tokens
             peft_model, tokenizer, ex["layer"], ex["direction"], ex["alpha"], ex["prompt"], device,
             n_trials=n_trials, max_new_tokens=max_new_tokens,
         )
-        matches = [exact_match_score(r, ex["target_label"], candidate_labels=all_labels) for r in reports]
-        rate = sum(matches) / len(matches)
-        results.append({"target_label": ex["target_label"], "layer": ex["layer"], "match_rate": rate, "reports": reports})
+        counts = score_reports(reports, ex["target_label"], candidate_labels=all_labels)
+        results.append({"target_label": ex["target_label"], "layer": ex["layer"], "match_rate": counts["rate"],
+                        "counts": counts, "reports": reports})
     return results
 
 
@@ -143,9 +144,12 @@ def main():
                               "['q_proj','k_proj','v_proj','o_proj'] (default). GPT-2 family: ['c_attn'].")
     parser.add_argument("--n_holdout_pairs", type=int, default=1)
     parser.add_argument("--n_holdout_layers", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0,
+                         help="Seeds LoRA initialisation and generation sampling (run several seeds for intervals).")
     args = parser.parse_args()
 
     device = CFG.device if torch.cuda.is_available() else "cpu"
+    seed_everything(args.seed)
     alpha = args.alpha if args.alpha is not None else CFG.stage2_alpha
 
     if args.dry_run:
@@ -195,7 +199,8 @@ def main():
     print("\nPost-training sanity eval on TRAINING examples (should now show high match rates):")
     eval_results = evaluate(peft_model, tokenizer, examples[: min(6, len(examples))], device)
     for r in eval_results:
-        print(f"  target='{r['target_label']}' layer={r['layer']}: match_rate={r['match_rate']:.2f}")
+        c = r["counts"]
+        print(f"  target='{r['target_label']}' layer={r['layer']}: match_rate={r['match_rate']:.2f} ({c['k']}/{c['n']})")
 
     os.makedirs(out_dir, exist_ok=True)
     peft_model.save_pretrained(out_dir)  # saves only the small LoRA weights, not the base model
@@ -203,13 +208,19 @@ def main():
         json.dump({
             "train_pairs": train_pairs, "held_out_pairs": held_out_pairs,
             "train_layers": train_layers, "held_out_layers": held_out_layers,
-            "alpha": alpha, "elicitation_prompt": CFG.stage2_prompt,
+            "alpha": alpha, "elicitation_prompt": CFG.stage2_prompt, "seed": args.seed,
         }, f, indent=2)
     with open(os.path.join(out_dir, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
     with open(os.path.join(out_dir, "training_eval.json"), "w") as f:
         json.dump(eval_results, f, indent=2)
-    print(f"\nSaved adapter + split.json + training_history.json + training_eval.json to {out_dir}/")
+    write_protocol(out_dir, "stage4", seed=args.seed, alpha=alpha, n_epochs=n_epochs, lr=args.lr,
+                   lora_r=args.lora_r, lora_alpha=args.lora_alpha, target_modules=args.target_modules,
+                   n_training_examples=len(examples), training_input_templates=TRAINING_INPUT_TEMPLATES,
+                   decoding=decoding_settings(3, 10, 0.8, use_chat_template=CFG.use_chat_template),
+                   sanity_eval="first 6 training examples only (one pair/layer) -- a smoke test, not a result",
+                   **model_protocol(CFG, device))
+    print(f"\nSaved adapter + split.json + training_history.json + training_eval.json + protocol.json to {out_dir}/")
 
 
 if __name__ == "__main__":

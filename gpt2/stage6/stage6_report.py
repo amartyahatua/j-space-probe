@@ -36,6 +36,23 @@ def format_num(x, decimals=4):
     return "n/a" if x is None else f"{x:.{decimals}f}"
 
 
+def format_kn(c):
+    """'k/n' from a {'k','n'} dict, or '-' when the results predate exact counts."""
+    return "-" if not c else f"{c['k']}/{c['n']}"
+
+
+def _row(label, m):
+    acc = m["accuracy_vs_direction_and_input"]
+    dfi = m["direction_following_index"]
+    pc = acc.get("pooled_counts", {})
+    ci = dfi.get("dfi_ci95_over_entries") or [None, None]
+    return (f"| {label} | {format_pct(acc['accuracy_vs_direction'])} ({format_kn(pc.get('direction'))}) "
+            f"| {format_pct(acc['accuracy_vs_input'])} ({format_kn(pc.get('input'))}) "
+            f"| {format_num(dfi['dfi_mean'], 2)} | [{format_num(ci[0], 2)}, {format_num(ci[1], 2)}] "
+            f"| [{format_num(dfi['dfi_min'], 2)}, {format_num(dfi['dfi_max'], 2)}] "
+            f"| {acc['n_entries']} | {dfi.get('n_generations', 0)} |")
+
+
 def to_markdown(m: dict) -> str:
     pre = m["pre_training"]
     post = m["post_training"]
@@ -47,18 +64,10 @@ def to_markdown(m: dict) -> str:
     lines.append("## Stage 6 metrics summary\n")
 
     lines.append("### 1-2. Accuracy vs. direction / vs. input, and direction-following index\n")
-    lines.append("| | vs. direction | vs. input | DFI (mean) | DFI (range) | n |")
-    lines.append("|---|---|---|---|---|---|")
-    lines.append(f"| Pre-training (Stage 3, base model) | {format_pct(pre['accuracy_vs_direction_and_input']['accuracy_vs_direction'])} "
-                  f"| {format_pct(pre['accuracy_vs_direction_and_input']['accuracy_vs_input'])} "
-                  f"| {format_num(pre['direction_following_index']['dfi_mean'], 2)} "
-                  f"| [{format_num(pre['direction_following_index']['dfi_min'], 2)}, {format_num(pre['direction_following_index']['dfi_max'], 2)}] "
-                  f"| {pre['accuracy_vs_direction_and_input']['n_entries']} |")
-    lines.append(f"| Post-training (Stage 5, trained adapter) | {format_pct(post['accuracy_vs_direction_and_input']['accuracy_vs_direction'])} "
-                  f"| {format_pct(post['accuracy_vs_direction_and_input']['accuracy_vs_input'])} "
-                  f"| {format_num(post['direction_following_index']['dfi_mean'], 2)} "
-                  f"| [{format_num(post['direction_following_index']['dfi_min'], 2)}, {format_num(post['direction_following_index']['dfi_max'], 2)}] "
-                  f"| {post['accuracy_vs_direction_and_input']['n_entries']} |")
+    lines.append("| | vs. direction (k/n) | vs. input (k/n) | DFI (mean) | DFI 95% CI over entries | DFI (range) | entries | generations |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append(_row("Pre-training (Stage 3, base model)", pre))
+    lines.append(_row("Post-training (Stage 5, trained adapter)", post))
 
     lines.append("\n### 3. Correlated-train -> decorrelated-test generalization gap\n")
     lines.append(f"- Correlated (in-sample, training-like) accuracy: **{format_pct(gap['correlated_accuracy'])}**")
@@ -75,9 +84,11 @@ def to_markdown(m: dict) -> str:
     lines.append("\n### 5. Report accuracy under direction-ablation vs. input-ablation\n")
     lines.append("| condition | match rate |")
     lines.append("|---|---|")
-    lines.append(f"| baseline (no ablation) | {format_pct(ab['baseline_mean'])} |")
-    lines.append(f"| direction ablated | {format_pct(ab['ablate_direction_mean'])} |")
-    lines.append(f"| input ablated | {format_pct(ab['ablate_input_mean'])} |")
+    pc = ab.get("pooled_counts", {})
+    lines.append(f"| baseline (no ablation) | {format_pct(ab['baseline_mean'])} ({format_kn(pc.get('baseline'))}) |")
+    lines.append(f"| direction ablated (alpha=0, hook active) | {format_pct(ab['ablate_direction_mean'])} ({format_kn(pc.get('ablate_direction'))}) |")
+    lines.append(f"| input ablated (bare elicitation prompt) | {format_pct(ab['ablate_input_mean'])} ({format_kn(pc.get('ablate_input'))}) |")
+    lines.append(f"| no-hook control (hook absent) | {format_pct(ab.get('no_hook_control_mean'))} ({format_kn(pc.get('no_hook_control'))}) |")
     lines.append(f"\n- Direction necessary in {format_pct(ab['direction_necessary_fraction'])} of tested combinations")
     lines.append(f"- Input necessary in {format_pct(ab['input_necessary_fraction'])} of tested combinations")
 
@@ -89,7 +100,7 @@ def main():
     parser.add_argument("--stage3", default="../stage3/stage3_results/stage3_results.json")
     parser.add_argument("--stage4_eval", default="../stage4/stage4_adapter/training_eval.json")
     parser.add_argument("--stage5", default="../stage5/stage5_results/stage5_results.json")
-    parser.add_argument("--stage3_condition", choices=["raw", "orthogonalized"], default="raw",
+    parser.add_argument("--stage3_condition", choices=["raw", "orthogonalized", "unembed_projected"], default="raw",
                          help="Which Stage 3 confound-(b) condition to use as the pre-training baseline.")
     parser.add_argument("--out_dir", default="stage6_report")
     args = parser.parse_args()

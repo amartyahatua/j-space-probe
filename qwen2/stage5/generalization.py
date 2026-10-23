@@ -29,14 +29,27 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage3"))
 
 from elicitation import elicit_reports
-from scoring import exact_match_score
-from decorrelation import build_bipolar_direction, build_input_content, build_cell_prompt, direction_following_index
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage1"))
+from scoring import exact_match_score, score_reports
+from decorrelation import (build_bipolar_direction, build_input_content, build_cell_prompt,
+                           direction_following_index, dfi_bootstrap)
+from protocol import alpha_over_norm
+
+
+def generate_over_texts(model, tokenizer, layer, direction, alpha, texts: List[str], elicitation_prompt: str,
+                        device: str, n_trials: int, max_new_tokens: int, apply_hook: bool = True) -> List[str]:
+    """`n_trials` generations for EACH input text, pooled in text order."""
+    reports = []
+    for text in texts:
+        reports += elicit_reports(model, tokenizer, layer, direction, alpha, f"{text}\n{elicitation_prompt}", device,
+                                  n_trials=n_trials, max_new_tokens=max_new_tokens, apply_hook=apply_hook)
+    return reports
 
 
 def evaluate_correlated(
     model, tokenizer, vectors, pairs: List[Tuple[str, str]], layers: List[int],
     alpha: float, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
-    candidate_labels: List[str] = None,
+    candidate_labels: List[str] = None, activation_norms=None,
 ) -> List[dict]:
     """
     candidate_labels: the full set of labels the trained adapter could
@@ -61,11 +74,11 @@ def evaluate_correlated(
                 prompt = f"{build_input_content(label)}\n{elicitation_prompt}"
                 reports = elicit_reports(model, tokenizer, layer, d_xy, sign * alpha, prompt, device,
                                           n_trials=n_trials, max_new_tokens=max_new_tokens)
-                scores = [s for s in (exact_match_score(r, label, candidate_labels=candidate_labels) for r in reports) if s is not None]
-                match_rate = sum(scores) / len(scores) if scores else None
+                counts = score_reports(reports, label, candidate_labels=candidate_labels)
                 results.append({
                     "pair": [x, y], "layer": layer, "alpha": sign * alpha, "target_label": label,
-                    "match_rate": match_rate, "reports": reports,
+                    "alpha_over_resid_norm": alpha_over_norm(alpha, layer, activation_norms or {}),
+                    "match_rate": counts["rate"], "counts": counts, "reports": reports,
                 })
     return results
 
@@ -73,7 +86,7 @@ def evaluate_correlated(
 def evaluate_decorrelated(
     model, tokenizer, vectors, pairs: List[Tuple[str, str]], layers: List[int],
     alpha: float, elicitation_prompt: str, device: str, n_trials: int = 3, max_new_tokens: int = 10,
-    candidate_labels: List[str] = None,
+    candidate_labels: List[str] = None, activation_norms=None, n_boot: int = 2000, boot_seed: int = 0,
 ) -> List[dict]:
     if candidate_labels is None:
         candidate_labels = list({label for pair in pairs for label in pair})
@@ -97,7 +110,10 @@ def evaluate_decorrelated(
             dfi = direction_following_index(reports_dirX_inputY, reports_dirY_inputX, x, y, all_labels=candidate_labels)
             results.append({
                 "pair": [x, y], "layer": layer, "alpha": alpha,
+                "alpha_over_resid_norm": alpha_over_norm(alpha, layer, activation_norms or {}),
                 "reports_dirX_inputY": reports_dirX_inputY, "reports_dirY_inputX": reports_dirY_inputX,
                 **dfi,
+                "dfi_bootstrap": dfi_bootstrap(reports_dirX_inputY, reports_dirY_inputX, x, y,
+                                                all_labels=candidate_labels, n_boot=n_boot, seed=boot_seed),
             })
     return results
