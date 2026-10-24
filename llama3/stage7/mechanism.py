@@ -134,7 +134,7 @@ def _label_position_logits(peft_model, tokenizer, inputs: dict, max_skip: int = 
     back in (greedy, up to `max_skip` times) and read the logits after it. Returns (logits, skipped_token_strings).
     The caller's editing hook is active for every forward pass here, as it is during generation.
     """
-    special = set(tokenizer.all_special_ids) - {tokenizer.eos_token_id}
+    special = set(getattr(tokenizer, "all_special_ids", []) or []) - {getattr(tokenizer, "eos_token_id", None)}
     ids, mask, skipped = inputs["input_ids"], inputs["attention_mask"], []
     for _ in range(max_skip + 1):
         lg = peft_model(input_ids=ids, attention_mask=mask).logits[0, -1].float()
