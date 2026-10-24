@@ -19,7 +19,7 @@ file is `jspace_lens.py`, not `jlens.py`.
 
 THE ONE CALL SITE THAT NEEDS TO CHANGE because of the rename --
 build_direction_bank.py's import line:
-    from jlens import build_jspace_directions
+    from jspace_lens import build_jspace_directions
 becomes:
     from jspace_lens import build_jspace_directions
 That's it. Nothing else in build_direction_bank.py changes; the
