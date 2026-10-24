@@ -157,6 +157,9 @@ def main():
                               "clamp value (-1.5..+1.5 x alpha) for the evaluated direction and 3 random directions. A "
                               "reporter that reads the direction has a positive slope for the real one only; a default "
                               "answer just shifts the intercept. Shows BOTH signs, unlike the sampled DFI.")
+    parser.add_argument("--n_random_sweep", type=int, default=3,
+                         help="Number of random directions in --alpha_sweep (forward passes only, cheap). Use 20+ to get a "
+                              "proper null distribution of slopes for the real direction to be compared with.")
     parser.add_argument("--no_fold_final_norm", action="store_true")
     parser.add_argument("--efficacy_check", action="store_true",
                          help="With --unembed_control: steering-KL of raw vs projected vs random direction at --layer.")
@@ -272,11 +275,18 @@ def main():
         print("\nSigned-alpha dose-response (logit injection - logit safe)...")
         sweep_prompts = all_cell_prompts(LABEL_INJECTION, "heldout") + all_cell_prompts(LABEL_SAFE, "heldout")
         dirs = {"real": eval_direction}
-        for i in range(3):
+        for i in range(args.n_random_sweep):
             dirs[f"random_{i}"] = _random_unit(model.config.hidden_size, f"stage7|sweep|{layer}|{i}", args.seed).to(device)
         sweep_result = signed_alpha_sweep(peft_model, tokenizer, layer, dirs, args.alpha,
                                           [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5], sweep_prompts, device,
                                           LABEL_INJECTION, LABEL_SAFE)
+        rand_slopes = sorted(v["slope_mean"] for n_, v in sweep_result["directions"].items() if n_ != "real")
+        real_slope = sweep_result["directions"]["real"]["slope_mean"]
+        sweep_result["summary"] = {"real_slope": real_slope, "random_slopes_sorted": rand_slopes,
+                                    "n_random_with_slope_ge_real": sum(x >= real_slope for x in rand_slopes),
+                                    "n_random": len(rand_slopes)}
+        print(f"  real slope {real_slope:+.3f}; {sweep_result['summary']['n_random_with_slope_ge_real']}/{len(rand_slopes)} "
+              f"random directions have slope >= real")
         for name, v in sweep_result["directions"].items():
             print(f"  {name:9s} slope={v['slope_mean']:+.3f}  logit-diff by multiplier="
                   f"{[round(x, 2) for x in v['logit_diff_by_multiplier']]}")
@@ -337,7 +347,7 @@ def main():
                                   BENIGN_TEXTS_TRAIN, BENIGN_TEXTS_HELDOUT)
     write_protocol(out_dir, "stage7", seed=args.seed, layer=layer, alpha=args.alpha, n_epochs=n_epochs, lr=args.lr,
                    shuffle="every epoch (seeded)", bootstrap_resamples=args.n_boot, n_contexts_for_jlens=len(contexts),
-                   direction_source=args.direction_source, random_swap=args.random_swap, alpha_sweep=args.alpha_sweep,
+                   direction_source=args.direction_source, random_swap=args.random_swap, alpha_sweep=args.alpha_sweep, n_random_sweep=args.n_random_sweep,
                    unembed_control=args.unembed_control, unembed_mode=args.unembed_mode if args.unembed_control else None,
                    fold_final_norm=not args.no_fold_final_norm, activation_norms_file=args.activation_norms,
                    decoding=decoding_settings(n_trials, max_new_tokens, 0.8),
