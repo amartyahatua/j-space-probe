@@ -135,7 +135,11 @@ def _label_position_logits(peft_model, tokenizer, inputs: dict, max_skip: int = 
     The caller's editing hook is active for every forward pass here, as it is during generation.
     """
     special = set(getattr(tokenizer, "all_special_ids", []) or []) - {getattr(tokenizer, "eos_token_id", None)}
-    ids, mask, skipped = inputs["input_ids"], inputs["attention_mask"], []
+    ids = inputs["input_ids"]
+    mask = inputs.get("attention_mask")
+    if mask is None:
+        mask = torch.ones_like(ids)
+    skipped = []
     for _ in range(max_skip + 1):
         lg = peft_model(input_ids=ids, attention_mask=mask).logits[0, -1].float()
         top = int(lg.argmax())
