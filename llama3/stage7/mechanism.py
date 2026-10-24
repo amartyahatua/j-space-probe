@@ -159,6 +159,26 @@ def signed_alpha_sweep(peft_model, tokenizer, layer, directions: dict, base_alph
                 lp = torch.logsumexp(logits[pos_ids], 0) - torch.logsumexp(logits[neg_ids], 0)
                 row.append(float(lp))
             per_prompt.append(row)
+        if name == "real":
+            # debug: what is the actual argmax next token (and the label-token logits) at m = -1 / +1 on one injection-text
+            # and one benign-text prompt? Lets us check that the label token ids we sum over are the ones the adapter emits.
+            dbg = []
+            for pi in (0, len(prompts) - 1):
+                text = format_prompt_for_chat(tokenizer, prompts[pi], use_chat_template)
+                inputs = {k: v.to(device) for k, v in tokenizer(text, return_tensors="pt").items()}
+                for m in (-1.0, 1.0):
+                    handle = apply_direction_editing(peft_model, layer, direction, m * base_alpha)
+                    try:
+                        with torch.no_grad():
+                            lg = peft_model(**inputs).logits[0, -1].float()
+                    finally:
+                        handle.remove()
+                    top = torch.topk(lg, 5)
+                    dbg.append({"prompt_index": pi, "multiplier": m,
+                                "top5": [(tokenizer.decode([int(i)]), round(float(v), 2)) for v, i in zip(top.values, top.indices)],
+                                "label_pos_logits": {tokenizer.decode([i]): round(float(lg[i]), 2) for i in pos_ids},
+                                "label_neg_logits": {tokenizer.decode([i]): round(float(lg[i]), 2) for i in neg_ids}})
+            out["first_token_debug"] = dbg
         slopes = [sum((m - mc) * (y - sum(row) / len(row)) for m, y in zip(ms, row)) / denom for row in per_prompt]
         mean_by_m = [sum(row[j] for row in per_prompt) / len(per_prompt) for j in range(len(ms))]
         out["directions"][name] = {"logit_diff_by_multiplier": mean_by_m, "per_prompt": per_prompt,
