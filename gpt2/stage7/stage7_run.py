@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from config import CFG
 from build_direction_bank import load_real_model
-from jlens import build_jspace_directions
+from jspace_lens import build_jspace_directions
 from decorrelation import build_bipolar_direction, direction_following_index, dfi_bootstrap
 from confounds import project_out_unembedding, steering_efficacy_comparison
 from scoring import SCORING_RULE

@@ -15,7 +15,7 @@ Two stages so far, each in its own directory:
 |---|---|
 | `config.py` | Model / SAE / extraction settings — edit this first |
 | `data.py` | FineWeb contexts + CounterFact triples (lazy-imports `datasets`) |
-| `jlens.py` | J-lens direction extraction (best-effort reimplementation — see docstring caveat) |
+| `jspace_lens.py` | J-lens direction extraction (best-effort reimplementation — see docstring caveat) |
 | `sae_features.py` | Loads a pretrained SAE via `sae_lens`, samples decoder-column directions stratified by abstraction |
 | `probes.py` | Mean-difference and logistic-regression probes on CounterFact-style pos/neg pairs |
 | `random_directions.py` | Fully-random and random-in-SAE-decoder-span directions, norm-matched to the other classes |
@@ -37,7 +37,7 @@ Output: `direction_bank/vectors.pt` + `direction_bank/metadata.json`.
 
 ### Known caveats to revisit
 
-- **`jlens.py`** is a best-effort reimplementation of the J-lens technique from its public description — validate the extracted directions show the expected signature (concentrated in middle layers) before trusting them as positive controls.
+- **`jspace_lens.py`** is a best-effort reimplementation of the J-lens technique from its public description — validate the extracted directions show the expected signature (concentrated in middle layers) before trusting them as positive controls.
 - **`data.py`**'s context loader uses FineWeb's `sample-10BT` config, not the unconfigured full corpus — the latter resolves to tens of thousands of shard files and can stall on streaming-shuffle.
 - **`data.py`**'s CounterFact field names assume the `NeelNanda/counterfact-tracing` schema — check/adjust if you use a different release.
 - SAE feature stratification falls back to uniform random sampling unless you supply per-feature activation frequencies.

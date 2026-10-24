@@ -32,7 +32,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stage1"))
 from config import CFG
 from build_direction_bank import load_real_model
-from jlens import build_jspace_directions
+from jspace_lens import build_jspace_directions
 
 from elicitation import elicit_reports
 

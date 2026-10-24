@@ -17,7 +17,7 @@ import os
 import torch
 
 from config import CFG
-from jlens import build_jspace_directions
+from jspace_lens import build_jspace_directions
 from sae_features import stratified_feature_sample, get_sae_directions
 from probes import build_probe_directions
 from random_directions import build_random_directions
