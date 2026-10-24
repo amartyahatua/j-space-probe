@@ -126,6 +126,28 @@ def _label_first_token_ids(tokenizer, label: str):
     return sorted(ids)
 
 
+def _label_position_logits(peft_model, tokenizer, inputs: dict, max_skip: int = 3):
+    """
+    Next-token logits at the position where the REPORT is written. Stage 4/7 training targets are tokenized with
+    add_special_tokens=True, so the adapters learn to emit <|begin_of_text|> first and the label second (the report
+    decoder drops special tokens, which hides this). If the argmax next token is a special token other than EOS, feed it
+    back in (greedy, up to `max_skip` times) and read the logits after it. Returns (logits, skipped_token_strings).
+    The caller's editing hook is active for every forward pass here, as it is during generation.
+    """
+    special = set(tokenizer.all_special_ids) - {tokenizer.eos_token_id}
+    ids, mask, skipped = inputs["input_ids"], inputs["attention_mask"], []
+    for _ in range(max_skip + 1):
+        lg = peft_model(input_ids=ids, attention_mask=mask).logits[0, -1].float()
+        top = int(lg.argmax())
+        if top in special and len(skipped) < max_skip:
+            skipped.append(tokenizer.decode([top]))
+            ids = torch.cat([ids, torch.tensor([[top]], device=ids.device)], dim=1)
+            mask = torch.cat([mask, torch.ones((1, 1), dtype=mask.dtype, device=mask.device)], dim=1)
+            continue
+        return lg, skipped
+    return lg, skipped
+
+
 def signed_alpha_sweep(peft_model, tokenizer, layer, directions: dict, base_alpha: float, multipliers, prompts: List[str],
                        device: str, label_pos: str, label_neg: str, use_chat_template: bool = True) -> dict:
     """
@@ -153,7 +175,7 @@ def signed_alpha_sweep(peft_model, tokenizer, layer, directions: dict, base_alph
                 handle = apply_direction_editing(peft_model, layer, direction, m * base_alpha)
                 try:
                     with torch.no_grad():
-                        logits = peft_model(**inputs).logits[0, -1].float()
+                        logits, _ = _label_position_logits(peft_model, tokenizer, inputs)
                 finally:
                     handle.remove()
                 lp = torch.logsumexp(logits[pos_ids], 0) - torch.logsumexp(logits[neg_ids], 0)
@@ -170,11 +192,11 @@ def signed_alpha_sweep(peft_model, tokenizer, layer, directions: dict, base_alph
                     handle = apply_direction_editing(peft_model, layer, direction, m * base_alpha)
                     try:
                         with torch.no_grad():
-                            lg = peft_model(**inputs).logits[0, -1].float()
+                            lg, skipped = _label_position_logits(peft_model, tokenizer, inputs)
                     finally:
                         handle.remove()
                     top = torch.topk(lg, 5)
-                    dbg.append({"prompt_index": pi, "multiplier": m,
+                    dbg.append({"prompt_index": pi, "multiplier": m, "skipped_special_tokens": skipped,
                                 "top5": [(tokenizer.decode([int(i)]), round(float(v), 2)) for v, i in zip(top.values, top.indices)],
                                 "label_pos_logits": {tokenizer.decode([i]): round(float(lg[i]), 2) for i in pos_ids},
                                 "label_neg_logits": {tokenizer.decode([i]): round(float(lg[i]), 2) for i in neg_ids}})

@@ -127,3 +127,8 @@ component?" — they are different questions, report both.
   Combine with `--unembed_control` to project it the same way as the J-lens direction.
 - `--random_swap` (jspace runs): after training on the J-lens direction, repeat the decorrelation test with a random unit
   direction clamped instead, no retraining -> `decorrelation_random_swap` in stage7_results.json.
+
+## Note: reports are written after a leading <|begin_of_text|> (Llama)
+Stage 4/7 training targets are tokenized with `add_special_tokens=True`, so adapters learn to emit BOS first and the label second.
+`skip_special_tokens=True` in decoding hides this, so sampled reports are unaffected. Any analysis that reads next-token logits
+must read them AFTER the BOS (`stage7/mechanism.py::_label_position_logits`); the first `--alpha_sweep` version did not.
