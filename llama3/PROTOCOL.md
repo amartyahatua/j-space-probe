@@ -117,3 +117,13 @@ indirect routes through later layers, and not other tokens' readout (synonyms, m
 `--unembed_scope all_labels`. In Stage 7 `train_and_eval` answers "can a reporter be trained to read the direction once
 the logit path is gone?"; `eval_only` answers "does the already-trained reporter's direction-following depend on that
 component?" — they are different questions, report both.
+
+
+## Stage 7 hardening (capstone)
+- Held-out set is now 5 phrasings per class (was 1). Decorrelation and held-out ablations run `--n_trials` generations on EVERY
+  phrasing and pool them; per-phrasing reports are stored under `decorrelation.per_phrasing`. n per cell = 5 x n_trials.
+  Results from the earlier 1-phrasing runs are not comparable and should not be pooled with these.
+- `--direction_source random`: seeded random unit direction (same dim, +alpha=injection, -alpha=safe) used for training AND evaluation.
+  Combine with `--unembed_control` to project it the same way as the J-lens direction.
+- `--random_swap` (jspace runs): after training on the J-lens direction, repeat the decorrelation test with a random unit
+  direction clamped instead, no retraining -> `decorrelation_random_swap` in stage7_results.json.

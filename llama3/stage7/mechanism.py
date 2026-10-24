@@ -28,7 +28,7 @@ from model_utils import get_transformer_layers, format_prompt_for_chat
 from editing import apply_direction_editing
 from scoring import exact_match_score, score_reports
 
-from covert_cognition import build_cell_prompt, ELICITATION_PROMPT, LABEL_INJECTION
+from covert_cognition import build_cell_prompt, all_cell_prompts, ELICITATION_PROMPT, LABEL_INJECTION
 
 
 def _generate(
@@ -80,23 +80,30 @@ def ablation_test(peft_model, tokenizer, layer, direction, alpha: float, target_
     text too, or it's answering a different question than the one
     that produced the interesting result.
     """
-    normal_prompt = build_cell_prompt(target_label, split=split)
-    ablated_input_prompt = ELICITATION_PROMPT                          # no scenario passage at all
+    # EVERY phrasing in the split is used (n_trials generations each, pooled), not just the first one.
+    normal_prompts = all_cell_prompts(target_label, split)
+    ablated_input_prompts = [ELICITATION_PROMPT]                       # no scenario passage at all
     sign = 1.0 if target_label == LABEL_INJECTION else -1.0
+    n_total_gens = n_trials * len(normal_prompts)
 
-    def rate(direction_alpha, prompt, apply_hook=True):
-        reports = _generate(peft_model, tokenizer, layer, direction, direction_alpha, prompt, device,
-                             n_trials=n_trials, max_new_tokens=max_new_tokens, apply_hook=apply_hook)
+    def rate(direction_alpha, prompts, apply_hook=True):
+        # keep n equal across the four conditions: the no-passage prompt gets the same total generations
+        per_prompt = n_total_gens // len(prompts)
+        reports = []
+        for prompt in prompts:
+            reports += _generate(peft_model, tokenizer, layer, direction, direction_alpha, prompt, device,
+                                 n_trials=per_prompt, max_new_tokens=max_new_tokens, apply_hook=apply_hook)
         counts = score_reports(reports, target_label)     # same scoring as exact_match_score, plus exact k/n
         return counts["rate"], reports, counts
 
-    baseline_rate, baseline_reports, baseline_counts = rate(sign * alpha, normal_prompt)
-    ablate_direction_rate, ablate_direction_reports, ablate_direction_counts = rate(0.0, normal_prompt)
-    ablate_input_rate, ablate_input_reports, ablate_input_counts = rate(sign * alpha, ablated_input_prompt)
-    no_hook_rate, no_hook_reports, no_hook_counts = rate(sign * alpha, normal_prompt, apply_hook=False)
+    baseline_rate, baseline_reports, baseline_counts = rate(sign * alpha, normal_prompts)
+    ablate_direction_rate, ablate_direction_reports, ablate_direction_counts = rate(0.0, normal_prompts)
+    ablate_input_rate, ablate_input_reports, ablate_input_counts = rate(sign * alpha, ablated_input_prompts)
+    no_hook_rate, no_hook_reports, no_hook_counts = rate(sign * alpha, normal_prompts, apply_hook=False)
 
     return {
         "target_label": target_label, "layer": layer, "alpha": sign * alpha, "split": split,
+        "n_phrasings": len(normal_prompts), "n_trials_per_phrasing": n_trials,
         "baseline": {"match_rate": baseline_rate, "counts": baseline_counts, "reports": baseline_reports},
         "ablate_direction": {"match_rate": ablate_direction_rate, "counts": ablate_direction_counts, "reports": ablate_direction_reports},
         "ablate_input": {"match_rate": ablate_input_rate, "counts": ablate_input_counts, "reports": ablate_input_reports},

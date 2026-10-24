@@ -33,6 +33,7 @@ from config import CFG
 from build_direction_bank import load_real_model
 from jlens import build_jspace_directions
 from decorrelation import build_bipolar_direction, direction_following_index, dfi_bootstrap
+from direction_source import _random_unit
 from confounds import project_out_unembedding, steering_efficacy_comparison
 from protocol import (seed_everything, write_protocol, decoding_settings, model_protocol,
                       load_activation_norms, alpha_over_norm)
@@ -43,7 +44,7 @@ from scoring import exact_match_score
 
 from covert_cognition import (
     ELICITATION_PROMPT, LABEL_INJECTION, LABEL_SAFE, TARGET_TOKENS,
-    build_cell_prompt, scenario_texts,
+    build_cell_prompt, all_cell_prompts, scenario_texts,
 )
 from mechanism import ablation_test
 
@@ -70,22 +71,37 @@ def train_covert_cognition_adapter(model, tokenizer, layer, direction, alpha, de
     return peft_model, history
 
 
+def _pooled_reports(peft_model, tokenizer, layer, direction, alpha, prompts, device, n_trials, max_new_tokens):
+    """n_trials generations for EACH prompt, pooled in prompt order. Also returns the per-prompt lists."""
+    per_prompt = [elicit_reports(peft_model, tokenizer, layer, direction, alpha, p, device,
+                                 n_trials=n_trials, max_new_tokens=max_new_tokens) for p in prompts]
+    return [r for rs in per_prompt for r in rs], per_prompt
+
+
 def run_decorrelation(peft_model, tokenizer, layer, direction, alpha, device, n_trials, max_new_tokens,
                       n_boot=2000, boot_seed=0):
     # both cells use HELD-OUT phrasings -- never seen during training at all, so this tests
-    # generalization to unseen scenario text, not just recall of the exact training sentences
-    prompt_cell1 = build_cell_prompt(LABEL_SAFE, split="heldout")       # direction=injection, scenario=benign
-    reports_dirInjection_inputSafe = elicit_reports(peft_model, tokenizer, layer, direction, alpha,
-                                                      prompt_cell1, device, n_trials=n_trials, max_new_tokens=max_new_tokens)
-    prompt_cell2 = build_cell_prompt(LABEL_INJECTION, split="heldout")  # direction=safe, scenario=injection
-    reports_dirSafe_inputInjection = elicit_reports(peft_model, tokenizer, layer, direction, -alpha,
-                                                      prompt_cell2, device, n_trials=n_trials, max_new_tokens=max_new_tokens)
+    # generalization to unseen scenario text, not just recall of the exact training sentences.
+    # EVERY held-out phrasing is used (n_trials generations each, pooled).
+    prompts_cell1 = all_cell_prompts(LABEL_SAFE, "heldout")       # direction=injection, scenario=benign
+    reports_dirInjection_inputSafe, per_prompt1 = _pooled_reports(
+        peft_model, tokenizer, layer, direction, alpha, prompts_cell1, device, n_trials, max_new_tokens)
+    prompts_cell2 = all_cell_prompts(LABEL_INJECTION, "heldout")  # direction=safe, scenario=injection
+    reports_dirSafe_inputInjection, per_prompt2 = _pooled_reports(
+        peft_model, tokenizer, layer, direction, -alpha, prompts_cell2, device, n_trials, max_new_tokens)
 
     dfi = direction_following_index(reports_dirInjection_inputSafe, reports_dirSafe_inputInjection,
                                      LABEL_INJECTION, LABEL_SAFE)
     return {
         "reports_dirInjection_inputSafe": reports_dirInjection_inputSafe,
         "reports_dirSafe_inputInjection": reports_dirSafe_inputInjection,
+        "n_phrasings_per_cell": [len(prompts_cell1), len(prompts_cell2)],
+        "n_trials_per_phrasing": n_trials,
+        # per-phrasing reports, so a reader can check no single phrasing is carrying the pooled number
+        "per_phrasing": {
+            "dirInjection_inputSafe": [{"prompt": p, "reports": r} for p, r in zip(prompts_cell1, per_prompt1)],
+            "dirSafe_inputInjection": [{"prompt": p, "reports": r} for p, r in zip(prompts_cell2, per_prompt2)],
+        },
         **dfi,
         "dfi_bootstrap": dfi_bootstrap(reports_dirInjection_inputSafe, reports_dirSafe_inputInjection,
                                         LABEL_INJECTION, LABEL_SAFE, n_boot=n_boot, seed=boot_seed),
@@ -127,6 +143,15 @@ def main():
                               "control: can a reporter be trained to read the direction once the logit path is gone?). "
                               "eval_only: adapter trained on the raw direction, evaluated on the projected one (does "
                               "the existing reporter's direction-following rely on that component?).")
+    parser.add_argument("--direction_source", choices=["jspace", "random"], default="jspace",
+                         help="jspace: the J-lens bipolar direction (the real experiment). random: a seeded random unit "
+                              "vector of the same dimension and sign convention (+alpha=injection, -alpha=safe), used for "
+                              "BOTH training and evaluation -- the negative control for 'the reporter reads the J-lens "
+                              "direction in particular'. Same adapter recipe, same texts, same alpha.")
+    parser.add_argument("--random_swap", action="store_true",
+                         help="jspace runs only: after training on the J-lens direction, ALSO run the decorrelation test "
+                              "with a random unit direction clamped in its place (no retraining). If DFI collapses, the "
+                              "trained reporter was reading that specific direction, not 'any clamped perturbation'.")
     parser.add_argument("--no_fold_final_norm", action="store_true")
     parser.add_argument("--efficacy_check", action="store_true",
                          help="With --unembed_control: steering-KL of raw vs projected vs random direction at --layer.")
@@ -171,8 +196,13 @@ def main():
         layer, n_epochs, n_trials, max_new_tokens = args.layer, args.n_epochs, args.n_trials, args.max_new_tokens
         out_dir = args.out_dir
 
-    print(f"Building injection-detection direction at layer {layer} from {len(contexts)} contexts...")
-    direction = build_direction(model, tokenizer, layer, contexts, device)
+    if args.direction_source == "random":
+        # seeded by (seed, layer) only, so every random-direction run with the same --seed uses the same vector
+        direction = _random_unit(model.config.hidden_size, f"stage7|injection|safe|{layer}", args.seed).to(device)
+        print(f"Using a RANDOM unit direction at layer {layer} (seed {args.seed}) instead of the J-lens direction.")
+    else:
+        print(f"Building injection-detection direction at layer {layer} from {len(contexts)} contexts...")
+        direction = build_direction(model, tokenizer, layer, contexts, device)
 
     # Output-pathway control. `direction` is the raw J-lens bipolar direction; the adapter is trained on
     # `train_direction` and everything (sanity check, decorrelation, mechanism) is evaluated on `eval_direction`.
@@ -223,6 +253,15 @@ def main():
     print(f"  P(report=injection | direction=injection): {decorrelation_result['p_dirX_matches_X']}")
     print(f"  P(report=safe | direction=injection, scenario=benign) [input following]: {decorrelation_result['p_dirX_matches_Y_input']}")
 
+    random_swap_result = None
+    if args.random_swap and args.direction_source == "jspace":
+        print("\nRandom-direction swap: same trained adapter, a random unit direction clamped instead...")
+        rand_dir = _random_unit(model.config.hidden_size, f"stage7|swap|{layer}", args.seed).to(device)
+        random_swap_result = run_decorrelation(peft_model, tokenizer, layer, rand_dir, args.alpha, device,
+                                                n_trials, max_new_tokens, n_boot=args.n_boot, boot_seed=args.seed)
+        print(f"  DFI with random direction: {random_swap_result['dfi_overall']}  "
+              f"(J-lens: {decorrelation_result['dfi_overall']})")
+
     print("\nRunning mechanism check (H4) -- on TRAIN phrasings first...")
     jac = jacobian_alignment_pre_post(peft_model, tokenizer, layer, eval_direction,
                                        build_cell_prompt(LABEL_INJECTION, split="train"), LABEL_INJECTION, device)
@@ -262,9 +301,11 @@ def main():
         json.dump({
             "layer": layer, "alpha": args.alpha, "seed": args.seed,
             "alpha_over_resid_norm": alpha_over_norm(args.alpha, layer, load_activation_norms(args.activation_norms)),
+            "direction_source": args.direction_source,
             "unembed_control": unembed_info,
             "training_history": history,
             "decorrelation": decorrelation_result,
+            "decorrelation_random_swap": random_swap_result,
             "jacobian_alignment": jac,
             "ablation_injection_train": ab_injection_train,
             "ablation_safe_train": ab_safe_train,
@@ -276,6 +317,7 @@ def main():
                                   BENIGN_TEXTS_TRAIN, BENIGN_TEXTS_HELDOUT)
     write_protocol(out_dir, "stage7", seed=args.seed, layer=layer, alpha=args.alpha, n_epochs=n_epochs, lr=args.lr,
                    shuffle="every epoch (seeded)", bootstrap_resamples=args.n_boot, n_contexts_for_jlens=len(contexts),
+                   direction_source=args.direction_source, random_swap=args.random_swap,
                    unembed_control=args.unembed_control, unembed_mode=args.unembed_mode if args.unembed_control else None,
                    fold_final_norm=not args.no_fold_final_norm, activation_norms_file=args.activation_norms,
                    decoding=decoding_settings(n_trials, max_new_tokens, 0.8),

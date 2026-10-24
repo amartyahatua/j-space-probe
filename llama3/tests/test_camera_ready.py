@@ -5,6 +5,8 @@ input providers, direction sources, seed aggregation). No downloads, no GPU:
     cd llama3 && python -m pytest tests -q
 """
 import math
+import os
+import sys
 
 import pytest
 import torch
@@ -336,3 +338,14 @@ def test_stage6_skips_entries_whose_projected_condition_collapsed():
     assert s["dfi_mean"] == pytest.approx(1.0) and s["n_generations"] == 4
     assert accuracy_vs_direction_and_input(flat)["pooled_counts"]["direction"] == {"k": 4, "n": 4, "wilson95": pytest.approx(
         accuracy_vs_direction_and_input(flat)["pooled_counts"]["direction"]["wilson95"])}
+
+
+def test_stage7_heldout_phrasings_are_disjoint_from_train_and_never_name_a_label():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stage7"))
+    import covert_cognition as cc
+    for label in (cc.LABEL_INJECTION, cc.LABEL_SAFE):
+        train, held = cc.scenario_texts(label, "train"), cc.scenario_texts(label, "heldout")
+        assert 5 <= len(held) <= 6 and not set(train) & set(held)
+        assert len(cc.all_cell_prompts(label, "heldout")) == len(held)
+        for t in train + held:
+            assert "injection" not in t.lower() and "safe" not in t.lower().split()
