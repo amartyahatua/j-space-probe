@@ -115,3 +115,52 @@ def ablation_test(peft_model, tokenizer, layer, direction, alpha: float, target_
         "hook_presence_alone_sufficient": (baseline_rate is not None and no_hook_rate is not None
                                             and no_hook_rate >= baseline_rate),
     }
+
+
+def _label_first_token_ids(tokenizer, label: str):
+    ids = set()
+    for variant in (label, " " + label, label.capitalize(), " " + label.capitalize()):
+        enc = tokenizer.encode(variant, add_special_tokens=False)
+        if enc:
+            ids.add(enc[0])
+    return sorted(ids)
+
+
+def signed_alpha_sweep(peft_model, tokenizer, layer, directions: dict, base_alpha: float, multipliers, prompts: List[str],
+                       device: str, label_pos: str, label_neg: str, use_chat_template: bool = True) -> dict:
+    """
+    Dose-response check that does NOT depend on which label the adapter says by default.
+
+    For each direction in `directions` ({name: unit vector}), clamp the signed value m * base_alpha for each m in
+    `multipliers`, and read the NEXT-TOKEN logit difference  logit(label_pos) - logit(label_neg)  (log-sum-exp over
+    the bare / space-prefixed / capitalised first tokens of each label) on every prompt. A reporter that reads the
+    direction shows a clearly positive slope of that difference against m; a default bias only shifts the intercept.
+    Slope is least-squares per prompt (so prompts are the unit of replication), then averaged.
+    """
+    pos_ids, neg_ids = _label_first_token_ids(tokenizer, label_pos), _label_first_token_ids(tokenizer, label_neg)
+    ms = [float(m) for m in multipliers]
+    mc = sum(ms) / len(ms)
+    denom = sum((m - mc) ** 2 for m in ms)
+    out = {"multipliers": ms, "base_alpha": base_alpha, "label_pos": label_pos, "label_neg": label_neg,
+           "n_prompts": len(prompts), "directions": {}}
+    for name, direction in directions.items():
+        per_prompt = []                                  # [prompt][multiplier] -> logit diff
+        for prompt in prompts:
+            text = format_prompt_for_chat(tokenizer, prompt, use_chat_template)
+            inputs = {k: v.to(device) for k, v in tokenizer(text, return_tensors="pt").items()}
+            row = []
+            for m in ms:
+                handle = apply_direction_editing(peft_model, layer, direction, m * base_alpha)
+                try:
+                    with torch.no_grad():
+                        logits = peft_model(**inputs).logits[0, -1].float()
+                finally:
+                    handle.remove()
+                lp = torch.logsumexp(logits[pos_ids], 0) - torch.logsumexp(logits[neg_ids], 0)
+                row.append(float(lp))
+            per_prompt.append(row)
+        slopes = [sum((m - mc) * (y - sum(row) / len(row)) for m, y in zip(ms, row)) / denom for row in per_prompt]
+        mean_by_m = [sum(row[j] for row in per_prompt) / len(per_prompt) for j in range(len(ms))]
+        out["directions"][name] = {"logit_diff_by_multiplier": mean_by_m, "per_prompt": per_prompt,
+                                    "slope_per_prompt": slopes, "slope_mean": sum(slopes) / len(slopes)}
+    return out

@@ -46,7 +46,7 @@ from covert_cognition import (
     ELICITATION_PROMPT, LABEL_INJECTION, LABEL_SAFE, TARGET_TOKENS,
     build_cell_prompt, all_cell_prompts, scenario_texts,
 )
-from mechanism import ablation_test
+from mechanism import ablation_test, signed_alpha_sweep
 
 
 def build_direction(model, tokenizer, layer: int, contexts, device: str) -> torch.Tensor:
@@ -152,6 +152,11 @@ def main():
                          help="jspace runs only: after training on the J-lens direction, ALSO run the decorrelation test "
                               "with a random unit direction clamped in its place (no retraining). If DFI collapses, the "
                               "trained reporter was reading that specific direction, not 'any clamped perturbation'.")
+    parser.add_argument("--alpha_sweep", action="store_true",
+                         help="After training: dose-response of the next-token logit(injection)-logit(safe) against the SIGNED "
+                              "clamp value (-1.5..+1.5 x alpha) for the evaluated direction and 3 random directions. A "
+                              "reporter that reads the direction has a positive slope for the real one only; a default "
+                              "answer just shifts the intercept. Shows BOTH signs, unlike the sampled DFI.")
     parser.add_argument("--no_fold_final_norm", action="store_true")
     parser.add_argument("--efficacy_check", action="store_true",
                          help="With --unembed_control: steering-KL of raw vs projected vs random direction at --layer.")
@@ -262,6 +267,20 @@ def main():
         print(f"  DFI with random direction: {random_swap_result['dfi_overall']}  "
               f"(J-lens: {decorrelation_result['dfi_overall']})")
 
+    sweep_result = None
+    if args.alpha_sweep:
+        print("\nSigned-alpha dose-response (logit injection - logit safe)...")
+        sweep_prompts = all_cell_prompts(LABEL_INJECTION, "heldout") + all_cell_prompts(LABEL_SAFE, "heldout")
+        dirs = {"real": eval_direction}
+        for i in range(3):
+            dirs[f"random_{i}"] = _random_unit(model.config.hidden_size, f"stage7|sweep|{layer}|{i}", args.seed).to(device)
+        sweep_result = signed_alpha_sweep(peft_model, tokenizer, layer, dirs, args.alpha,
+                                          [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5], sweep_prompts, device,
+                                          LABEL_INJECTION, LABEL_SAFE)
+        for name, v in sweep_result["directions"].items():
+            print(f"  {name:9s} slope={v['slope_mean']:+.3f}  logit-diff by multiplier="
+                  f"{[round(x, 2) for x in v['logit_diff_by_multiplier']]}")
+
     print("\nRunning mechanism check (H4) -- on TRAIN phrasings first...")
     jac = jacobian_alignment_pre_post(peft_model, tokenizer, layer, eval_direction,
                                        build_cell_prompt(LABEL_INJECTION, split="train"), LABEL_INJECTION, device)
@@ -306,6 +325,7 @@ def main():
             "training_history": history,
             "decorrelation": decorrelation_result,
             "decorrelation_random_swap": random_swap_result,
+            "alpha_sweep": sweep_result,
             "jacobian_alignment": jac,
             "ablation_injection_train": ab_injection_train,
             "ablation_safe_train": ab_safe_train,
@@ -317,7 +337,7 @@ def main():
                                   BENIGN_TEXTS_TRAIN, BENIGN_TEXTS_HELDOUT)
     write_protocol(out_dir, "stage7", seed=args.seed, layer=layer, alpha=args.alpha, n_epochs=n_epochs, lr=args.lr,
                    shuffle="every epoch (seeded)", bootstrap_resamples=args.n_boot, n_contexts_for_jlens=len(contexts),
-                   direction_source=args.direction_source, random_swap=args.random_swap,
+                   direction_source=args.direction_source, random_swap=args.random_swap, alpha_sweep=args.alpha_sweep,
                    unembed_control=args.unembed_control, unembed_mode=args.unembed_mode if args.unembed_control else None,
                    fold_final_norm=not args.no_fold_final_norm, activation_norms_file=args.activation_norms,
                    decoding=decoding_settings(n_trials, max_new_tokens, 0.8),
